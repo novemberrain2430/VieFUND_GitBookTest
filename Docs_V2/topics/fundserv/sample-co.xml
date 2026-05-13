@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  ============================================================================
+  SAMPLE CO (Confirmation Order) FILE - Fundserv Standards V36
+  ============================================================================
+  
+  File này là ví dụ mẫu cấu trúc CO file mà Dealer (VieFund) sinh ra
+  để gửi tới Fundserv Network → Manufacturer.
+  
+  Được generate bởi: UBFFImport.COrder.OrderFileGenerate()
+  Ghi vào thư mục:   FILE_PATH_UPLOAD (cấu hình trong PopupFundServ Settings)
+  
+  CO file chứa 1 hoặc nhiều TFS (Transaction/Financial Submission) records.
+  Mỗi record là 1 lệnh giao dịch: Buy (PUR), Sell (RED), Switch (SWI/SWO),
+  Transfer (TFI/TFO), hoặc Fee Redemption.
+  
+  Fundserv Standards V36 - Effective June 15, 2026
+  ============================================================================
+-->
+
+<!-- ========================================================================
+     ROOT ELEMENT: FundServTFS
+     Một CO file có thể chứa nhiều dealer codes, nhiều orders
+     ======================================================================== -->
+<FundServTFS>
+  
+  <!-- ====================================================================
+       FILE HEADER
+       Thông tin chung về file
+       ==================================================================== -->
+  <FileHdr>
+    <SndrCode>DLR001</SndrCode>              <!-- Dealer Code (sender) -->
+    <RcvrCode>MGT999</RcvrCode>              <!-- Manufacturer Code (receiver) -->
+    <CreationDate>2026-06-16</CreationDate>   <!-- Ngày tạo file -->
+    <CreationTime>14:30:25</CreationTime>     <!-- Giờ tạo file -->
+    <FileVersion>36</FileVersion>             <!-- Fundserv Standards Version -->
+    <TestProdInd>P</TestProdInd>              <!-- P=Production, T=Test -->
+  </FileHdr>
+
+
+  <!-- ====================================================================
+       ORDER 1: MUA QUỸ (Purchase / Buy)
+       Action Code = PUR
+       ==================================================================== -->
+  <Order>
+    <OrderReq>
+      <ActionCode>PUR</ActionCode>            <!-- PUR=Purchase, RED=Redeem, SWI=Switch In, SWO=Switch Out -->
+      <SourceID>VF20260616-001</SourceID>     <!-- Tracking number (unique per order) -->
+      
+      <!-- Thông tin Dealer/Advisor -->
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>             <!-- Dealer code (4 chars) -->
+        <RepCode>REP123</RepCode>             <!-- Representative/Advisor code -->
+        <BranchCode>BR01</BranchCode>         <!-- Branch code -->
+      </Advisor>
+      
+      <!-- Thông tin tài khoản -->
+      <AcctSetup>
+        <AcctDesig>2</AcctDesig>              <!-- 1=Client Name, 2=Nominee, 3=Intermediary -->
+        <AcctType>A</AcctType>                <!-- A=RRSP, B=RRIF, C=Non-Reg, E=RESP, H=TFSA, T=FHSA -->
+        <FundAcctID>FA-2026-00012345</FundAcctID>  <!-- Fund Account ID at Manufacturer -->
+        <Currency>CAD</Currency>              <!-- CAD or USD -->
+        
+        <!-- Thông tin client (nếu AcctDesig=1 Client Name) -->
+        <ClientInfo>
+          <Individual>
+            <FirstName>Jean</FirstName>
+            <LastName>Tremblay</LastName>
+            <SIN>123456789</SIN>              <!-- Social Insurance Number (9 digits) -->
+            <BirthDate>1975-03-15</BirthDate>
+          </Individual>
+        </ClientInfo>
+        
+        <!-- Quebec Joint Account (V36 DOT 153) -->
+        <!-- Nếu Province = QC: JointSurvivorType phải = "TIC" (Tenants in Common) -->
+        <!-- Không được dùng "JT" (Joint Tenants) cho Quebec -->
+        <!--
+        <JointSurvivorType>TIC</JointSurvivorType>
+        <Joint>
+          <ClientID>CLT-002</ClientID>
+          <Individual>
+            <FirstName>Marie</FirstName>
+            <LastName>Tremblay</LastName>
+            <SIN>987654321</SIN>
+          </Individual>
+        </Joint>
+        -->
+      </AcctSetup>
+      
+      <!-- Thông tin quỹ đầu tư cần mua -->
+      <PurchFund>
+        <FundCode>ABC1234</FundCode>          <!-- Fund CUSIP or Fundserv Code -->
+        <MgmtCode>MGT999</MgmtCode>          <!-- Management Company Code -->
+        <GrossAmt>10000.00</GrossAmt>         <!-- Tổng tiền (gross) -->
+        <FELPct>0.00</FELPct>                 <!-- Front-End Load % (0 = no load) -->
+        <SettlMethod>N$M</SettlMethod>        <!-- N$M=Net Settlement, CHQ=Cheque, EFT=Electronic -->
+        <TradeDate>2026-06-16</TradeDate>     <!-- Ngày giao dịch -->
+        <SettlDate>2026-06-18</SettlDate>     <!-- Ngày thanh toán (T+2) -->
+        <EMDQualifier>0</EMDQualifier>        <!-- 0=Normal, 1=PAC (Pre-Authorized) -->
+      </PurchFund>
+    </OrderReq>
+  </Order>
+
+
+  <!-- ====================================================================
+       ORDER 2: BÁN QUỸ (Redemption / Sell)
+       Action Code = RED
+       Bao gồm V36 TCR Deductions (DOT 149)
+       ==================================================================== -->
+  <Order>
+    <OrderReq>
+      <ActionCode>RED</ActionCode>            <!-- RED = Redemption (Sell) -->
+      <SourceID>VF20260616-002</SourceID>
+      
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>
+        <RepCode>REP456</RepCode>
+        <BranchCode>BR01</BranchCode>
+      </Advisor>
+      
+      <AcctSetup>
+        <AcctDesig>2</AcctDesig>
+        <AcctType>C</AcctType>                <!-- C = Non-Registered -->
+        <FundAcctID>FA-2026-00098765</FundAcctID>
+        <Currency>CAD</Currency>
+      </AcctSetup>
+      
+      <!-- Thông tin quỹ cần bán -->
+      <RedemptionFund>
+        <FundCode>XYZ5678</FundCode>
+        <MgmtCode>MGT999</MgmtCode>
+        <GrossAmt>25000.00</GrossAmt>         <!-- Gross redemption amount -->
+        <RedOption>D</RedOption>              <!-- A=All Units, D=Dollar Amount, U=Units -->
+        <SettlMethod>N$M</SettlMethod>
+        <TradeDate>2026-06-16</TradeDate>
+        <SettlDate>2026-06-19</SettlDate>
+
+        <!-- ================================================================
+             V36 TCR DEDUCTIONS (DOT 149) - 4 loại mới
+             Các khoản trừ trước khi trả tiền cho investor.
+             Manufacturer sẽ trả về trong TS file với giá trị thực tế.
+             ================================================================ -->
+        <Deductions>
+          <!-- DSC: Deferred Sales Charge (đã có từ trước V36) -->
+          <DSCFee>0.00</DSCFee>
+          
+          <!-- OtherFee: Phí khác (đã có từ trước V36) -->
+          <OtherFee>0.00</OtherFee>
+          
+          <!-- AdminFee: Administration Fee (đã có từ trước V36) -->
+          <AdminFee>0.00</AdminFee>
+          
+          <!-- ===== 4 DEDUCTION MỚI CỦA V36 (DOT 149) ===== -->
+          
+          <!-- EarlyRdmtnFee: Short-term / Early Redemption Fee
+               Phí phạt bán sớm (thường 2% nếu bán trong 30-90 ngày) -->
+          <EarlyRdmtnFee>150.00</EarlyRdmtnFee>
+          
+          <!-- DlrAdvsrFee: Dealer/Advisor Service Fee
+               Phí dịch vụ Dealer/Advisor trừ từ proceeds -->
+          <DlrAdvsrFee>0.00</DlrAdvsrFee>
+          
+          <!-- MVA: Market Value Adjustment
+               Điều chỉnh giá trị thị trường (Segregated Funds) -->
+          <MVA>0.00</MVA>
+          
+          <!-- IRSTax: IRS Tax Withholding
+               Thuế khấu trừ IRS cho US non-resident -->
+          <IRSTax>0.00</IRSTax>
+        </Deductions>
+      </RedemptionFund>
+    </OrderReq>
+  </Order>
+
+
+  <!-- ====================================================================
+       ORDER 3: CHUYỂN ĐỔI QUỸ (Switch)
+       Bán Fund A → Mua Fund B (cùng Manufacturer)
+       Gồm 2 records: SWO (Switch Out) + SWI (Switch In)
+       ==================================================================== -->
+  <Order>
+    <OrderReq>
+      <ActionCode>SWO</ActionCode>            <!-- SWO = Switch Out (bán) -->
+      <SourceID>VF20260616-003A</SourceID>
+      <LinkedSourceID>VF20260616-003B</LinkedSourceID>  <!-- Link với SWI -->
+      
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>
+        <RepCode>REP123</RepCode>
+        <BranchCode>BR01</BranchCode>
+      </Advisor>
+      
+      <AcctSetup>
+        <AcctDesig>2</AcctDesig>
+        <AcctType>H</AcctType>                <!-- H = TFSA -->
+        <FundAcctID>FA-TFSA-00055555</FundAcctID>
+        <Currency>CAD</Currency>
+      </AcctSetup>
+      
+      <SwitchFundOut>
+        <FundCode>ABC1234</FundCode>          <!-- Quỹ bán ra -->
+        <MgmtCode>MGT999</MgmtCode>
+        <GrossAmt>5000.00</GrossAmt>
+        <RedOption>D</RedOption>
+        <TradeDate>2026-06-16</TradeDate>
+      </SwitchFundOut>
+    </OrderReq>
+  </Order>
+  
+  <Order>
+    <OrderReq>
+      <ActionCode>SWI</ActionCode>            <!-- SWI = Switch In (mua) -->
+      <SourceID>VF20260616-003B</SourceID>
+      <LinkedSourceID>VF20260616-003A</LinkedSourceID>  <!-- Link với SWO -->
+      
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>
+        <RepCode>REP123</RepCode>
+        <BranchCode>BR01</BranchCode>
+      </Advisor>
+      
+      <AcctSetup>
+        <AcctDesig>2</AcctDesig>
+        <AcctType>H</AcctType>
+        <FundAcctID>FA-TFSA-00055555</FundAcctID>
+        <Currency>CAD</Currency>
+      </AcctSetup>
+      
+      <SwitchFundIn>
+        <FundCode>DEF9012</FundCode>          <!-- Quỹ mua vào -->
+        <MgmtCode>MGT999</MgmtCode>
+        <GrossAmt>5000.00</GrossAmt>          <!-- = SWO amount -->
+        <FELPct>0.00</FELPct>
+        <TradeDate>2026-06-16</TradeDate>
+      </SwitchFundIn>
+    </OrderReq>
+  </Order>
+
+
+  <!-- ====================================================================
+       ORDER 4: CHUYỂN TÀI KHOẢN (Transfer)
+       Chuyển units từ Dealer khác sang Dealer này
+       ==================================================================== -->
+  <Order>
+    <OrderReq>
+      <ActionCode>TFI</ActionCode>            <!-- TFI=Transfer In, TFO=Transfer Out -->
+      <SourceID>VF20260616-004</SourceID>
+      
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>             <!-- Dealer nhận -->
+        <RepCode>REP789</RepCode>
+        <BranchCode>BR02</BranchCode>
+      </Advisor>
+      
+      <!-- Tài khoản mới tại Dealer nhận -->
+      <AcctSetup>
+        <AcctDesig>2</AcctDesig>
+        <AcctType>A</AcctType>                <!-- A = RRSP -->
+        <FundAcctID></FundAcctID>             <!-- Trống nếu là tài khoản mới -->
+        <Currency>CAD</Currency>
+        
+        <ClientInfo>
+          <Individual>
+            <FirstName>Pierre</FirstName>
+            <LastName>Dupont</LastName>
+            <SIN>111222333</SIN>
+            <BirthDate>1980-07-22</BirthDate>
+          </Individual>
+        </ClientInfo>
+        
+        <!-- V36 DOT 163: Successor Annuitant cho RRIF và FHSA -->
+        <!-- Trước V36: chỉ hỗ trợ cho TFSA -->
+        <!-- Sau V36: hỗ trợ TFSA (AcctType=H), RRIF (B), FHSA (T) -->
+        <!--
+        <SuccessorAnnuitant>
+          <Individual>
+            <FirstName>Marie</FirstName>
+            <LastName>Dupont</LastName>
+            <SIN>444555666</SIN>
+            <BirthDate>1982-11-30</BirthDate>
+          </Individual>
+          <Relationship>SP</Relationship>
+        </SuccessorAnnuitant>
+        -->
+      </AcctSetup>
+      
+      <!-- Thông tin Dealer gửi (nguồn) -->
+      <TransferFrom>
+        <DlrCode>DLR002</DlrCode>             <!-- Dealer gốc -->
+        <RepCode>OTH001</RepCode>
+        <FundCode>ABC1234</FundCode>
+        <MgmtCode>MGT999</MgmtCode>
+        <TransferType>1</TransferType>        <!-- 1=All In Kind, 2=Partial, 3=Cash -->
+        <TradeDate>2026-06-16</TradeDate>
+      </TransferFrom>
+    </OrderReq>
+  </Order>
+
+
+  <!-- ====================================================================
+       ORDER 5: FEE REDEMPTION (Phí trích từ tài khoản)
+       V36 DOT 155: Mở rộng cho Client Name accounts (AcctDesig=1)
+       ==================================================================== -->
+  <Order>
+    <OrderReq>
+      <ActionCode>RED</ActionCode>
+      <SourceID>VF20260616-005</SourceID>
+      <EPA>Y</EPA>                            <!-- EPA = Electronic Payment Authorization -->
+      
+      <Advisor>
+        <DlrCode>DLR001</DlrCode>
+        <RepCode>REP123</RepCode>
+        <BranchCode>BR01</BranchCode>
+      </Advisor>
+      
+      <AcctSetup>
+        <!-- V36 DOT 155: Trước V36, Fee Redemption chỉ cho AcctDesig=2,3
+             Sau V36: Cho phép AcctDesig=1 (Client Name) với SettlMethod=N$M -->
+        <AcctDesig>1</AcctDesig>              <!-- 1=Client Name (MỚI cho Fee Redemption) -->
+        <AcctType>C</AcctType>                <!-- C=Non-Registered -->
+        <FundAcctID>FA-CN-00077777</FundAcctID>
+        <Currency>CAD</Currency>
+      </AcctSetup>
+      
+      <RedemptionFund>
+        <FundCode>GHI3456</FundCode>
+        <MgmtCode>MGT999</MgmtCode>
+        <GrossAmt>500.00</GrossAmt>           <!-- Phí trích từ tài khoản -->
+        <RedOption>D</RedOption>
+        <!-- V36: Fee Redemption cho Client Name BẮT BUỘC dùng N$M settlement -->
+        <SettlMethod>N$M</SettlMethod>
+        <TradeDate>2026-06-16</TradeDate>
+        <SettlDate>2026-06-18</SettlDate>
+        <FeeReason>A</FeeReason>              <!-- A=Advisory Fee, S=Service Fee -->
+      </RedemptionFund>
+    </OrderReq>
+  </Order>
+
+
+  <!-- ====================================================================
+       FILE TRAILER
+       ==================================================================== -->
+  <FileTrl>
+    <RecordCount>5</RecordCount>              <!-- Tổng số order records -->
+    <TotalGrossAmt>40500.00</TotalGrossAmt>   <!-- Tổng gross amount -->
+    <FileChecksum>A1B2C3D4</FileChecksum>     <!-- Checksum để verify -->
+  </FileTrl>
+
+</FundServTFS>
+
+
+<!--
+  ============================================================================
+  GHI CHÚ IMPLEMENTATION
+  ============================================================================
+  
+  1. ENCODING: File phải dùng Windows-1252 encoding (m_FileEncoding trong VieFUNDIE)
+  
+  2. FILE NAMING CONVENTION:
+     - Format: {DealerCode}_{Sequence}_{DateTime}.xml
+     - Ví dụ: DLR001_0001_20260616143025.xml
+  
+  3. FLOW TRONG SOURCE CODE:
+     WebApp:
+       PopupTradeAdd.aspx.cs → OnSaveOrder() → DB (status=Pending)
+       PopupOrderBatch.aspx.cs → OnGenerateOrderFileBtn() → CTrx.OrderPendingMove2Waiting()
+     
+     VieFUNDIE Service (mỗi 60s):
+       OnTimer() → UBFFImport.COrder.OrderFileGenerate(DBID, DSID, FILE_PATH_UPLOAD)
+       → Đọc orders Waiting từ DB → Generate XML như file này → Ghi vào OUT folder
+       → Gửi qua IBM MQ (MQ_NAMESEND) hoặc để file server đẩy lên Fundserv
+  
+  4. V36 CHANGES HIGHLIGHT:
+     ┌─────────────────────────────────────────────────────────────────┐
+     │ DOT 149: TCR Deductions                                       │
+     │   → Thêm 4 fields: EarlyRdmtnFee, DlrAdvsrFee, MVA, IRSTax   │
+     │   → Trong section <Deductions> của Sell/Redemption orders      │
+     │                                                                │
+     │ DOT 153: Quebec Joint Account                                  │
+     │   → JointSurvivorType PHẢI = "TIC" nếu Province = QC          │
+     │   → Validation trong PopupPlanAdd.aspx.cs                      │
+     │                                                                │
+     │ DOT 155: Client Name Fee Redemptions                           │
+     │   → AcctDesig=1 được phép cho Fee Redemption                   │
+     │   → BẮT BUỘC SettlMethod = N$M                                │
+     │   → Logic trong PanelFeeRedemptionOrder.aspx.cs                │
+     │                                                                │
+     │ DOT 163: Successor Annuitant RRIF & FHSA                      │
+     │   → SuccessorAnnuitant section mở rộng cho AcctType B,T        │
+     │   → Logic trong PopupPlanAdd.aspx.cs                           │
+     └─────────────────────────────────────────────────────────────────┘
+  
+  5. RESPONSE: Sau khi Manufacturer xử lý, sẽ gửi lại:
+     - TS file (Transaction Reconciliation) → xác nhận/từ chối
+     - FS file (Settlement Instruction) → thông tin thanh toán
+     → Được VieFUNDIE import qua FFImport.ProcessAllX()
+  
+  ============================================================================
+-->

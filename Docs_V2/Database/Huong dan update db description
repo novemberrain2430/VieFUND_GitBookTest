@@ -1,0 +1,21 @@
+trong thư mục Docs_V2\Database:
+Viết script1 để khi tôi copy file Tables_new.sql vào và chạy script thì sinh ra file kết quả so sánh với file Table_Description.md xem thêm/bớt gì trong database, file kết quả có sẵn column description để tôi ghi chú, và script2 để cập nhật column/ ghi chú vào file gốc Tables.sql và Table_Description.md
+Đã xong. Tóm tắt:
+
+2 Scripts đã tạo trong Docs_V2\Database\
+Script	Chức năng
+Compare-Tables.ps1	Parse Tables_new.sql, so sánh với Table_Description.md, tạo Tables_Diff.md
+Apply-Changes.ps1	Đọc annotations từ Tables_Diff.md, merge với descriptions cũ, cập nhật cả 2 file gốc
+Workflow sử dụng
+1. Export schema mới từ SQL Server → lưu thành Tables_new.sql
+2. Copy vào Docs_V2\Database\
+3. Chạy:  powershell -ExecutionPolicy Bypass -File Compare-Tables.ps1
+4. Mở Tables_Diff.md → ghi chú Description cho columns mới
+5. Chạy:  powershell -ExecutionPolicy Bypass -File Apply-Changes.ps1
+
+
+Đặc điểm chính
+Preserve descriptions: Mọi ghi chú cũ trong Table_Description.md được giữ nguyên
+Preserve notes: Các block > **Notes** bên dưới mỗi bảng cũng được giữ
+Auto-backup: Apply-Changes.ps1 tự tạo backup vào _backups/ trước khi ghi đè
+Priority merge: Annotation mới từ diff > Description cũ > empty
