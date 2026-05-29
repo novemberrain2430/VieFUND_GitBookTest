@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ErrorSet>
+  <NtwrkError>
+    <RspnSrc>N</RspnSrc>
+    <RtnCode>99</RtnCode>
+    <ErrorCode>999</ErrorCode>
+    <CorrlatnID>414D51204653514D554154202020202020260430232405</CorrlatnID>
+    <OrdID>CO-2026-0001</OrdID>
+  </NtwrkError>
+</ErrorSet>
