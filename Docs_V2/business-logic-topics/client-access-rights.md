@@ -1,4 +1,4 @@
-In term of what user can see and can do: One rep should not be able to see other reps’ client.  
+﻿In term of what user can see and can do: One rep should not be able to see other reps� client.  
 Each rep (member) might have multiple rep codes.  
 Generally each client belongs to a rep (that might have multiple rep codes)  
 So there might be a few instances of the same client on the system and one rep does not know that the client has also account (plans) with someone else.  
@@ -9,7 +9,7 @@ A and T are industry standard value for Account Status. Any other statuses are o
    
 Client Name, Nominee and Intermediary: those are only 3 account designation types in Canada.  
 Each account designation type has rules.  
-Generally, Client Name: means the Account at the fund company is held directly under the client (the investor’s) name  
+Generally, Client Name: means the Account at the fund company is held directly under the client (the investor�s) name  
 Nominee: the account at the fund company is held under the dealer name and the client is the beneficiary owner  
 Intermediary: the account at the fund company is held under the intermediary company name and the client is the beneficiary owner  
    

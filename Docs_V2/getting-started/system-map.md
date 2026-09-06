@@ -38,7 +38,7 @@
 │                  BUSINESS LOGIC LAYER (BLL)                  │
 │  UBClasses (113 files, 5.1MB)  — Domain entities + logic     │
 │  VFOmnibus (6 files)           — Omnibus processing          │
-│  VFOnBoarding (15 files)       — Onboarding services         │
+│  VFOnBoarding (29 files)       — Onboarding services         │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────▼────────────────────────────────────┐
@@ -114,8 +114,8 @@
 |---|---|---|---|---|
 | 3 | **UBClasses** | 113 | 5,137 KB | Domain entities: Customer, Plan, Trx, Compliance, Fee... |
 | 4 | **VFOmnibus** | 6 | 181 KB | Omnibus account processing, switches, conversions |
-| 5 | **VFOnBoarding** | 15 | 397 KB | Onboarding web services (ASMX) |
-| 6 | **OnboardingWebServices** | 13 | 272 KB | Older onboarding WS |
+| 5 | **VFOnBoarding** | 29 | 409 KB | Onboarding web services (ASMX), 54 WebMethod active |
+| 6 | **OnboardingWebServices** | 26 | 282 KB | Older onboarding WS, 38 WebMethod active |
 
 ### 3.3 Data Access Layer
 

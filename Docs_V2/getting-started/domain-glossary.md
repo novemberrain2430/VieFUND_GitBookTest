@@ -16,7 +16,7 @@
 | **Transaction (Trx)** | `CTrx` | Một giao dịch mua/bán/chuyển fund. Là đơn vị công việc chính của hệ thống. Chứa: loại (Buy/Sell/Switch/Transfer), số tiền, units, trạng thái, ngày xử lý. | `Trx.cs` (264KB) |
 | **Dealer** | `Dealer` | Công ty môi giới (brokerage firm). Quản lý nhiều advisors và clients. Có `DealerCode`. | `Dealer.cs` (32KB) |
 | **Dealer Branch** | `DealerBranch` | Chi nhánh của dealer. | `DealerBranch.cs` (21KB) |
-| **Dealer Sub-Branch** | `DealerSubBranch` | Chi nhánh con. Mapped bởi `DSIDSub`. | `DealerSubBranch.cs` (15KB) |
+| **Dealer Sub-Branch** | `DealerSubBranch` | Chi nhánh con trong DB, liên kết dealership bằng `iDealershipID`. Không có bằng chứng session `DSIDSub` map trực tiếp tới entity này. | `DealerSubBranch.cs` (15KB) |
 | **Member** | `Member` | Người dùng hệ thống (user account). Có `UserID`, `LoginID`, `MemberType`. Không nhầm với client (investor). | `Member.cs` (214KB) |
 | **Advisor** | `Advisor` | Cố vấn tài chính — người tư vấn cho client. Thuộc về một dealer. | `Advisor.cs` (24KB) |
 | **Trust Account** | `TrustAccount` | Tài khoản ủy thác (trust) — dealer giữ tiền hộ trước khi gửi đến fund company. | `TrustAccount.cs` (218KB) |
@@ -172,8 +172,10 @@ Xem chi tiết tại [Error Correction](../business-logic-topics/error-correctio
 | **T4FHSA** | Tax slip — FHSA. | `T4FHSA.cs` (35KB) |
 | **T5008** | Tax slip — Bán chứng khoán (securities transactions). | `T5008.cs` (31KB) |
 | **T619** | File truyền dữ liệu thuế đến CRA (electronic filing). | `T619.cs` (18KB) |
-| **T550** | File báo cáo RRSP/RRIF contributions. | `T550.cs` (20KB) |
+| **T550** | XML theo specimen/contract của registered plan; source chứa specimen number/name, account type, contract start và annuitant. | `T550.cs`, `UBExport/T550XML.cs` |
 | **NR4** | Tax slip — Thu nhập trả cho người không cư trú (non-resident). | `NR4.cs` (31KB) |
+| **Part XVIII (P18)** | Return thuộc nhóm CRS/FATCA; XML gồm account holder, controlling person, reporting financial institution và payment/market-value amounts. | `P18.cs`, `UBExport/P18XML.cs` |
+| **Part XIX (P19)** | Return thuộc nhóm CRS/FATCA; XML gồm tax residence/TIN, account holder, controlling person và payment amounts. | `P19.cs`, `UBExport/P19XML.cs` |
 | **RL-2** | Relevé (Quebec) — Tương đương T4RSP/T4RIF cho Quebec. | `RL2.cs` (31KB) |
 | **RL-3** | Relevé (Quebec) — Tương đương T5 cho Quebec. | `RL3.cs` (32KB) |
 | **RL-16** | Relevé (Quebec) — Tương đương T3. | `RL16.cs` (31KB) |
@@ -206,8 +208,8 @@ Xem chi tiết tại [Error Correction](../business-logic-topics/error-correctio
 | Thuật ngữ | Mô tả | Code reference |
 |---|---|---|
 | **DBID** | Database ID — xác định database instance. Mỗi DBID = 1 connection string. Dùng cho multi-tenant ở tầng database. | Session var, `CDatabase(DBIDStr)` |
-| **DSID** | Dealership ID — xác định dealer trong database. Dùng cho multi-tenant ở tầng data. WHERE clause: `DSID = @DSID`. | Session var, SP param |
-| **DSIDSub** | Sub-dealership ID — phân cấp dealer con. | Session var |
+| **DSID** | Dealership context trong database. Scope có thể qua `DSID`, `iDealershipID`, ownership chain hoặc access-list; DAL không tự thêm predicate. DSID > 10000 còn có thể mang member-group prefix. | Session var, SP param |
+| **DSIDSub** | Hậu tố sub-site/customization tùy chọn được giữ trong session và custom asset path. Source hiện có chưa chứng minh đây là khóa data isolation hay `UB_DealerSubBranch.ID`. | Session var, `CFunctions.GetCustomPath` |
 | **Lg** | Language: `0` = English, `1` = French. Dùng khắp nơi trong code. | SP param, Session var |
 | **UserID** | ID người dùng đang login (từ bảng Member). Không nhầm với ClientID. | Session var |
 | **LoginID** | ID phiên login (session-level). Khác UserID (user-level). | Session var |

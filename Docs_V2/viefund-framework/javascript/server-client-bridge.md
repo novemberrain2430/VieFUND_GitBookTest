@@ -219,7 +219,7 @@ Dùng cho nội dung đa ngôn ngữ (Multilingual) trong markup:
 
 ## 5. Thứ tự nạp (Load Order) — Rất quan trọng
 
-Mỗi trang `.aspx` chính được ghép từ nhiều file include theo thứ tự cố định:
+Mỗi trang `.aspx` chính được ghép từ nhiều file include. Thứ tự phổ biến đã xác minh trên `Client.aspx`, `AccountView.aspx` và `TrxView.aspx` là:
 
 ```
 1. Inc/PageHeader.aspx
@@ -228,8 +228,8 @@ Mỗi trang `.aspx` chính được ghép từ nhiều file include theo thứ t
    ├── Include MenuFunctions.js
    └── Khai báo bPageBusy, AltCSSTitle
 
-2. Inc/SessionVars.aspx          ◄── TẤT CẢ BIẾN TOÀN CỤC SESSION
-   └── ~36 biến var LoginID, IsSetupUser, CanAddTrx...
+2. form + hidden fields
+   └── PageLg, hdiLoginID, hdGUID, szFileName...
 
 3. Inc/UBMenuInit.aspx
    ├── Include DateStr_EN.js hoặc DateStr_FR.js (theo ngôn ngữ)
@@ -237,17 +237,23 @@ Mỗi trang `.aspx` chính được ghép từ nhiều file include theo thứ t
    ├── Include UBMenuDropdown.js
    └── Include StatusBar.js
 
-4. [Nội dung trang chính]
+4. SetCurrentMenu(...) + Inc/SessionVars.aspx
+   └── các biến LoginID, IsSetupUser, CanAddTrx...
+
+5. Inc/UBMenuContent.aspx
+   └── nạp menu EN/FR và dùng các biến Session ở bước 4
+
+6. [Nội dung trang chính]
    └── Các <script> inline, hidden fields, form controls
 
-5. Inc/PageFooter.aspx
+7. Inc/PageFooter.aspx
    ├── Reset cursor = default
    ├── Hàm CheckLoaded()
    ├── Hàm resizeDlg800()
    └── Set bPageBusy = 0
 ```
 
-**Hệ quả:** Nếu một biến được sử dụng trong `MenuFunctions.js` (load ở bước 1), nhưng khai báo ở `SessionVars.aspx` (bước 2), thì biến đó **chưa tồn tại** tại thời điểm file JS được parse. Vì vậy, toàn bộ code trong `MenuFunctions.js` luôn kiểm tra `typeof` trước khi sử dụng:
+**Hệ quả:** `MenuFunctions.js` được parse trước khi `SessionVars.aspx` khai báo biến, còn action chỉ chạy sau khi trang đã render. Code vẫn thường kiểm tra `typeof` để có thể dùng trên page/popup không include đầy đủ SessionVars và để chịu được khác biệt cấu hình:
 
 ```javascript
 // Pattern bắt buộc: luôn check typeof

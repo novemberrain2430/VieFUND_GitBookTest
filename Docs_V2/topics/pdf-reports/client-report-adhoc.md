@@ -1,330 +1,166 @@
 # Client Report PDF — Ad-hoc Generation
 
-> Module tạo báo cáo PDF theo yêu cầu (ad-hoc) cho khách hàng — bao gồm toàn bộ pipeline từ lúc user nhấn "Generate" đến khi file PDF được lưu vào DB.
-> **Đối tượng**: Developer .NET cần hiểu kiến trúc, thêm loại report mới, hoặc debug vấn đề PDF.
+> Trạng thái: **đã đối chiếu source/SP/DB snapshot ngày 2026-09-05**. Đây là pipeline “Run now” của màn hình Client Report, không phải toàn bộ hệ thống report scheduler.
 
----
+## 1. Luồng thực tế
 
-## 1. Tổng quan nghiệp vụ
+```mermaid
+sequenceDiagram
+    participant UI as PopupClientReportTypes
+    participant DB as SQL Server/TMP
+    participant Worker as CReport background Thread
+    participant PDF as Report generator
 
-Chức năng "Client Report" cho phép Advisor/Admin in báo cáo đầu tư cho một hoặc nhiều khách hàng cùng lúc. Mỗi lần in tạo ra một **Request** trong DB, một background thread sẽ xử lý bất đồng bộ, tổng hợp PDF cho từng client, sau đó lưu kết quả để user download.
-
-### Các loại report hiện có
-
-| `iReportType` | Tên nghiệp vụ | Hàm BLL |
-|---|---|---|
-| `1` | Account Statement | `ClientAccountStatementPdfObj` |
-| `2` | Investor Statement | `ClientInvestorStatementPdfObj(..., false)` |
-| `3` | Asset Mix | `ClientAssetMixPdfObj` |
-| `5` | Account Statement + XIRR Since Inception | `ClientAccountStatementPdfObj_XIRR` |
-| `6` | Investor Statement (Nominee) | `ClientInvestorStatementPdfObj(..., true)` |
-| `7` | Investor Statement + XIRR | `ClientInvestorStatementPdfObj_XIRR` |
-| `8` | Account Statement + Capital Gain | `ClientAccountStatementPdfObj_CG` |
-| `9` | Account Statement 2015 format | `ClientAccountStatementPdfObj_2015` |
-| `10` | Account Statement + Daily Graph | `ClientAccountStatementPdfObj_DailyGraph` |
-| `11` | Commission Disclosure | `ClientCommission` |
-| `12` | Investment Performance | `ClientInvestmentPerformance` |
-| `13` | Account Summary by Supplier | `AccountSummaryBySupplierPdfObj` |
-| `14` | Portfolio Performance | `ClientPortfolioPerformance` |
-| `50` | Account Statement (Transactions Only) | `ClientAccountStatementPdfObjTrxOnly` |
-| `104` | Holding Performance + Portfolio Summary | `ClientHoldingPerformanceAndPortfolioSummary` |
-
-> **Nguồn**: `VieFUNDPdf/ClientReportAdhoc.cs` L55-118
-
----
-
-## 2. Kiến trúc tổng thể
-
-```
-User nhấn "Generate Report"
-        │
-        ▼
-[WebApp] Tạo Request trong DB (SP: UBReportAdd + UBReportRequestTMP)
-        │
-        ▼
-[CReport] StartCreatePdfObjClientReportAdhoc()
-        │  (khởi động Thread riêng, Priority = Normal)
-        ▼
-[CReport] CreatePdfObjClientReportAdhoc()  ← chạy trong background thread
-        │
-        ├── Đọc metadata từ DB: SP UBReportRequestTMP
-        │     → ReportType, EffectiveDate, ClientList, Options
-        │
-        ├── [count ≤ 5 clients] CreatePdfObjClientReportAdhocMemory()
-        │         Xử lý hoàn toàn trong RAM (byte[])
-        │
-        └── [count > 5 clients] CreatePdfObjClientReportAdhocFile()
-                  Ghi qua file tạm → đọc lại → xóa file
-        │
-        ▼
-SavePdfObj2TMP(TMPFILE_CLIENT)  ← lưu byte[] PDF vào bảng TMP
-        │
-        ▼
-ClientReportAdhocEnd()  ← đánh dấu Request hoàn thành (SP: UBReportRequestTMPEnd)
-        │
-        ▼
-m_FinishCallback(iRet)  ← thông báo cho WebApp
+    UI->>DB: UBReportRequestAddTMP
+    DB-->>UI: iRequestID
+    UI->>Worker: StartCreatePdfObjClientReportAdhoc
+    Worker->>DB: UBReportRequestTMP(bRemove=1)
+    DB-->>Worker: ReportInfo + ClientList + Options
+    loop từng client
+        Worker->>PDF: dispatch theo iReportType
+        PDF-->>Worker: byte[] PDF
+    end
+    Worker->>DB: UBReportPdfObjTMPAdd
+    Worker->>DB: UBReportRequestTMPEnd
+    Worker-->>UI: FinishCallback(iRet)
 ```
 
-> **Nguồn**: `VieFUNDPdf/ClientReportAdhoc.cs` L239-305
+Entry point UI là [`PopupClientReportTypes.aspx.cs`](../../../WebApp/Main/PopupClientReportTypes.aspx.cs#L1219). UI xây `KeyIDStr/KeyValueStr`, gọi `CReport.AddRequestTMP`, rồi:
 
----
+- `iRunMode=0`: tạo `CReport`, khởi động thread trong web process và giữ handler trong Session;
+- `iRunMode>0`: chỉ báo request đã gửi cho service. Nhánh scheduled/service dùng request bền (`UB_ReportRequest`) và nằm ngoài pipeline TMP mô tả ở đây.
 
-## 3. Hai chế độ tạo PDF
+## 2. Request và data contract
 
-### 3.1 Memory Mode — `CreatePdfObjClientReportAdhocMemory()`
+### 2.1. Tạo request
 
-Dùng khi **số client ≤ 5**. Toàn bộ xử lý trong RAM.
+`CReport.AddRequestTMP()` gọi `UBReportRequestAddTMP` ([source](../../../VieFUNDPdf/CReport.cs#L6590)). SP:
 
-**Luồng xử lý:**
-1. Duyệt từng `iClientID` trong `ClientList`.
-2. Kiểm tra `m_Abort` trước mỗi iteration — cho phép user hủy giữa chừng.
-3. Gọi hàm report tương ứng với `m_iReportType` → nhận `byte[] PdfObj`.
-4. Merge tích lũy: `MainPdfObj = PdfBuilder.Merge2PdfObjs(MainPdfObj, PdfObj, ...)`.
-5. Trả về `MainPdfObj` (toàn bộ PDF đã merge).
+- lấy tập rep user được truy cập qua `UBMemberRepAccessList` hoặc danh sách rep chỉ định;
+- dựng client list từ một client, search list, favorite list hoặc toàn bộ client của rep;
+- lưu request/options/client list vào các bảng TMP;
+- trả `iRequestID`, hoặc `0` ở wrapper nếu `iRet>0`.
 
-> **Nguồn**: `VieFUNDPdf/ClientReportAdhoc.cs` L33-135
+`UBReportAdd` **không** tạo request ad-hoc; đó là SP tính dữ liệu summary được `Customer.GetSummaryDataSet()` gọi. Tài liệu cũ đã nhầm hai vai trò này.
 
-### 3.2 File Mode — `CreatePdfObjClientReportAdhocFile()`
+### 2.2. Đọc và consume request
 
-Dùng khi **số client > 5**. Tránh tràn RAM với tập client lớn.
+`ClientReportAdhocHeaderSet()` gọi `UBReportRequestTMP` với `bRemove=true` ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L306)). SP trả ba result set có `RecType`:
 
-**Luồng xử lý:**
-1. Tạo `PdfBase.Document` + `PdfBase.PdfCopy` ghi vào `FileStream` (file tạm).
-2. Duyệt từng client, gọi hàm report → `byte[] PdfObj`.
-3. `PdfBuilder.AddPdfObjToPdfCopy()` — ghi trực tiếp vào file thay vì merge vào RAM.
-4. `pdfDoc.Close()`.
-5. Đọc lại file → `byte[] MainPdfObj`.
-6. `File.Delete()` xóa file tạm.
-
-> **Nguồn**: `VieFUNDPdf/ClientReportAdhoc.cs` L137-237
-
----
-
-## 4. Report Type 5: Account Statement + XIRR
-
-### 4.1 Điểm vào — `ClientAccountStatementPdfObj_XIRR()`
-
-**File**: `CReport.cs` L3287
-
-Là **orchestrator** — không tự tính toán, chỉ điều phối.
-
-**3 tùy chọn nghiệp vụ đọc từ `tbOption`:**
-
-| Option Key | Kiểu | Mô tả |
-|---|---|---|
-| `SplitByDealerCode` | int | `0` = gộp tất cả; `1+` = tách theo dealer |
-| `SplitGroupID` | int | Nhóm dealer cụ thể khi split |
-| `IncludeCostDisclosure` | int | Mức độ công khai chi phí (xem bảng bên dưới) |
-
-### 4.2 Phân nhánh: Tách hay gộp theo Dealer
-
-**Không tách** (`SplitByDealerCode == 0`):
-```
-XIRROne(DealerCode = "") → MainPdfObj
-```
-
-**Tách theo dealer** (`SplitByDealerCode != 0`):
-```
-GetClientDealerCodeListX()  → danh sách Dealer của client
-  ↓ for each Dealer:
-    XIRROne(DealerCode = "D1") → PdfObj
-    Merge(MainPdfObj, PdfObj)
-```
-
-> Lý do tách theo dealer: quy định tuân thủ (compliance) yêu cầu mỗi đại lý phân phối nhận báo cáo riêng cho phần tài sản mình quản lý.
-
-Lưu ý: cờ `bExcludeCompensation` trên từng dealer — nếu `true`, bỏ qua phụ lục hoa hồng cho dealer đó.
-
-### 4.3 Logic `IncludeCostDisclosure` — Phụ lục bắt buộc theo luật
-
-| Giá trị | Phụ lục được ghép vào PDF |
+| Result set | Nội dung |
 |---|---|
-| `0` | Không thêm gì (chỉ Statement chính) |
-| `1` | + **Commission** (hoa hồng) |
-| `2` | + **Commission** + **Investment Performance** |
-| `3` | + **Investment Performance** + **Commission** (thứ tự đảo) |
-| `4` | + **Investment Performance** only |
+| `ReportInfo` | `iReportType`, status, user, effective/from/transaction-from dates. |
+| `ClientList` | Danh sách `iClientID`, sort theo tên. |
+| `Options` | Cặp `KeyID`/`KeyValue` do UI gửi. |
 
-> **Nguồn**: `VieFUNDPdf/CReport.cs` L3291-3385
+Sau khi select, SP xóa request/client/options khi `bRemove=1`. Worker vẫn gọi `UBReportRequestTMPEnd` ở cuối để cleanup thêm `UB_ReportRepListClientTMP` và các dòng còn sót.
 
-### 4.4 Hàm con — `ClientAccountStatementPdfObj_XIRROne()`
+## 3. Dispatch report type
 
-**File**: `CReport.cs` L3387
+Các type sau có trong memory-mode switch ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L55)):
 
-Đây là nơi **thực sự tạo PDF**. Nhận thêm tham số `DealerCodeSpec` để lọc dữ liệu theo dealer.
+| Type | Generator được gọi | Data/SP tiêu biểu đã xác minh |
+|---:|---|---|
+| `1` | `ClientAccountStatementPdfObj` | `UBReportClientAccountStatement` |
+| `2` | `ClientInvestorStatementPdfObj(..., false)` | Nhánh DataSet trong `CReport.cs`; có tên SP động theo option. |
+| `3` | `ClientAssetMixPdfObj` | `UBReportClientAssetMix` |
+| `5` | `ClientAccountStatementPdfObj_XIRR` | `UBReportClientAccountStatement_XIRR` |
+| `6` | `ClientInvestorStatementPdfObj(..., true)` | Cùng family investor statement. |
+| `7` | `ClientInvestorStatementPdfObj_XIRR` | `UBReportClientInvestorStatement_XIRR` |
+| `8` | `ClientAccountStatementPdfObj_CG` | `UBReportClientCapitalGainStatement` |
+| `9` | `ClientAccountStatementPdfObj_2015` | `UBReportClientAccountStatement_2015` |
+| `10` | `ClientAccountStatementPdfObj_DailyGraph` | `UBReportClientAccountStatementWithDailyGraph` |
+| `11` | `ClientCommission` | `UBReportClientCommission` |
+| `12` | `ClientInvestmentPerformance` | Report/performance dataset trong `CReport`. |
+| `13` | `AccountSummaryBySupplierPdfObj` | `UBReportClientAccountSummaryBySupplier` |
+| `14` | `ClientPortfolioPerformance` | Portfolio performance pipeline trong `CReport`/`ClientPerformance`. |
+| `50` | `ClientAccountStatementPdfObjTrxOnly` | `UBReportClientAccountStatementTrxOnly` |
+| `104` | `ClientHoldingPerformanceAndPortfolioSummary` | Ghép holding performance và portfolio summary. |
 
-**Luồng:**
-1. Đọc toàn bộ các display option từ `tbOption` (~30 options).
-2. Gọi `DSClientAccountStatement_XIRR()` → lấy `DataSet` từ DB (bao gồm dữ liệu portfolio, XIRR, lịch sử tỷ suất).
-3. Gọi `PdfObjClientAccountStatement_XIRR(dsClient, tbOption)` → dựng PDF.
-4. Nếu có `XMLFileName`: extract dữ liệu ra XML song song.
-5. Trả về `byte[] PdfObj`.
+Không thêm type mới chỉ ở UI: phải thêm cùng contract ở request definition, worker dispatch, generator, SP/data set và download/persistence.
 
-**Các option hiển thị chính:**
+## 4. Memory mode và file mode
 
-| Option Key | Default | Mô tả |
-|---|---|---|
-| `IncludeGIC` | 1 | Hiển thị GIC trong report |
-| `IncludeCash` | 1 | Hiển thị tài khoản tiền mặt |
-| `IncludeStock` | 1 | Hiển thị cổ phiếu |
-| `NoZeroUnitAccount` | 1 | Ẩn account có 0 units |
-| `ShowBVAccount` | 0 | Hiển thị Book Value cấp Account |
-| `ShowBVPlan` | 0 | Hiển thị Book Value cấp Plan |
-| `ShowPercentagePlan` | 0 | Hiển thị phần trăm allocation theo plan |
-| `RORHistorical` | 1 | Hiển thị bảng tỷ suất lịch sử |
-| `RORHistoricalGraph` | 1 | Hiển thị biểu đồ tỷ suất lịch sử |
-| `ShowROR` | 0 | Option hiển thị Rate of Return |
-| `ShowTrx` | 1 | Hiển thị giao dịch |
-| `PlanPieChart` | 0 | Biểu đồ tròn phân bổ theo plan |
-| `Plan3QBarChart` | 1 | Biểu đồ cột 3 quý |
-| `ExInactivePlan` | 1 | Ẩn plan không hoạt động |
-| `ExcludeSegFund` | 0 | Loại trừ Segregated Fund |
-| `TaggedPlanOnly` | 0 | Chỉ in plan được đánh dấu |
-| `IncludeRisk` | 0 | Bao gồm Risk Summary |
-| `NoXRate` | 0 | Không hiển thị Exchange Rate |
-| `LogoOption` | 0 | Tùy chọn logo trên report |
-| `MFDALogo` | false | Hiển thị logo MFDA |
-| `UseClientLg` | 1 | Dùng ngôn ngữ của client |
-| `RecalcAssetAlways` | 1 | Luôn recalculate asset |
+### 4.1. Memory mode (`<=5` client)
 
-> **Nguồn**: `VieFUNDPdf/CReport.cs` L3391-3461
+`CreatePdfObjClientReportAdhocMemory()` tạo `byte[]` từng client rồi merge bằng `PdfBuilder.Merge2PdfObjs`. Nó hỗ trợ đủ 15 report type trong bảng trên và kiểm tra `m_Abort` trước mỗi client.
 
----
+### 4.2. File mode (`>5` client)
 
-## 5. Stored Procedures liên quan
+`CreatePdfObjClientReportAdhocFile()` mở `PdfCopy`, add từng PDF vào file tạm, đóng document, đọc file lại thành `byte[]` và xóa file.
 
-| SP | Vai trò | Gọi từ |
-|---|---|---|
-| `UBReportRequestTMP` | Lấy metadata request (ClientList, Options, Dates) | `ClientReportAdhocHeaderSet()` |
-| `UBReportRequestTMPEnd` | Đánh dấu request hoàn thành | `ClientReportAdhocEnd()` |
-| `DSClientAccountStatement_XIRR` | Lấy toàn bộ dữ liệu portfolio + XIRR cho report | `XIRROne()` |
-| `UBReportAdd` | Tạo report request mới từ UI | WebApp |
-| `SavePdfObj2TMP` | Lưu byte[] PDF vào bảng TMP | `CreatePdfObjClientReportAdhoc()` |
+Source hiện chỉ có case `1,2,3,5,6,7,8,9,10,13`. Type `11,12,14,50,104` rơi vào `default`, tạo `PdfObj=null`. Đây là khác biệt chức năng theo số lượng client, không phải chỉ là tối ưu bộ nhớ.
 
-> **Nguồn**: `VieFUNDPdf/ClientReportAdhoc.cs` L306-388
+## 5. Lưu output và trạng thái
 
----
+`CreatePdfObjClientReportAdhoc()` gọi `SavePdfObj2TMP(DBIDStr, TMPFILE_CLIENT, UserID, MainPdfObj)`. Wrapper này gọi `UBReportPdfObjTMPAdd`, insert/update `UB_ReportObjTMP` theo `(iUserID, iType)` ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L564080)).
 
-## 6. Cách thêm loại report mới
+Hệ quả:
 
-Để thêm một `iReportType` mới (ví dụ: `case 15`), cần thực hiện theo thứ tự:
+- kết quả TMP là “slot mới nhất” theo user/type, không phải lịch sử bất biến theo request;
+- request khác của cùng user/type có thể overwrite output nếu chạy chồng nhau;
+- download phải giữ đúng user/type/session contract.
 
-### Bước 1 — Tạo hàm Orchestrator
+`iRet` callback:
 
-Tạo hàm theo mẫu `ClientAccountStatementPdfObj_XIRR`:
+| Giá trị | Nghĩa ở worker |
+|---:|---|
+| `0` | Có PDF và lưu TMP trả ID > 0. |
+| `1` | Không tạo/lưu được output. |
+| `2` | Worker thấy `m_Abort`. |
 
-```csharp
-static public byte[] ClientYourReportPdfObj(string DBIDStr, int iUserID, int iClientID,
-    DataTable tbOption, string EffectiveDate, string EffectiveDateFrom,
-    int iRecordID, string XMLFileName, string TrxDateFrom, int iObjID)
-{
-    int iSplitByDealerCode = GetReportOptionInt(tbOption, "SplitByDealerCode", 0);
-    int iSplitGroup = GetReportOptionInt(tbOption, "SplitGroupID", 0);
-    int iIncludeCostDisclosure = GetReportOptionInt(tbOption, "IncludeCostDisclosure", 0);
+## 6. Option contract
 
-    byte[] MainPdfObj = null;
-    byte[] PdfObj = null;
-    bool bFirst = true;
+UI serialize option thành hai chuỗi key/value; SP chuyển lại thành bảng `Options`. Generator đọc option bằng helper `GetReportOption*`. Các key thường gặp:
 
-    if (iSplitByDealerCode == 0)
-    {
-        MainPdfObj = ClientYourReportPdfObjOne(DBIDStr, iUserID, iClientID,
-            tbOption, EffectiveDate, EffectiveDateFrom, iRecordID, XMLFileName, "", TrxDateFrom, iObjID, true);
-        // ghép phụ lục nếu cần (iIncludeCostDisclosure)
-    }
-    else
-    {
-        // split by dealer — xem pattern trong ClientAccountStatementPdfObj_XIRR L3329-3384
-    }
-    return MainPdfObj;
-}
-```
+- dữ liệu: `IncludeGIC`, `IncludeCash`, `IncludeStock`, `ShowTrx`, `TrxCapGain`;
+- layout: `ShowBVAccount`, `ShowBVPlan`, `ShowPercentagePlan`, chart/ROR flags;
+- lọc: `ExInactivePlan`, `ExcludeSegFund`, `TaggedPlanOnly`, intermediary/exempt options;
+- branding/localization: `LogoOption`, `MFDALogo`, `UseClientLg`, bulletin;
+- disclosure: `IncludeCostDisclosure`, `IncludeRiskSummary`;
+- split: `SplitByDealerCode`, `SplitGroupID`.
 
-### Bước 2 — Tạo hàm `...One`
+Đây là contract stringly typed: sai chính tả thường rơi về default và không có compile-time error. Khi đổi key phải tìm cả UI writer lẫn mọi generator reader.
 
-Hàm này nhận thêm `DealerCodeSpec` và `bObjIDFirst`, thực hiện:
-1. Đọc options từ `tbOption`.
-2. Gọi SP lấy dữ liệu → `DataSet`.
-3. Gọi `PdfObj...()` dựng PDF → trả về `byte[]`.
+## 7. Findings
 
-### Bước 3 — Đăng ký trong switch/case
+### PDF-ADHOC-01 — file mode thiếu năm report type
 
-Trong **`ClientReportAdhoc.cs`**, thêm vào **cả hai** hàm:
-- `CreatePdfObjClientReportAdhocMemory()` — L55-118
-- `CreatePdfObjClientReportAdhocFile()` — L179-222
+Với `>5` client, type `11`, `12`, `14`, `50`, `104` không có trong switch file mode dù memory mode hỗ trợ. Kết quả có thể là PDF thiếu client/nội dung hoặc `MainPdfObj` không hợp lệ. Nên dùng một hàm dispatch chung cho cả hai mode.
 
-```csharp
-case 15:
-    PdfObj = ClientYourReportPdfObj(DBIDStr, UserID, iClientID,
-                tbOption, EffectiveDate, EffectiveDateFrom, iRequestID, XMLFileStr, TrxDateFrom, 0);
-    break;
-```
+### PDF-ADHOC-02 — đọc thiếu byte cuối file PDF
 
-### Bước 4 — Cập nhật UI
+File mode cấp phát `new byte[stream.Length - 1]` rồi chỉ đọc số byte đó ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L227)). Output bị cắt đúng một byte. Một số PDF reader có thể tự phục hồi, nhưng đây vẫn là binary corruption. Phải cấp phát `stream.Length` và đọc đủ stream.
 
-Thêm option `iReportType = 15` vào dropdown chọn loại report trong WebApp (trang `ClientStatement.aspx` hoặc tương đương).
+### PDF-ADHOC-03 — abort có thể để lại file/handle
 
----
+Trong vòng lặp file mode, khi `m_Abort=true`, hàm `return null` trước `pdfDoc.Close()` và `File.Delete()`. Cần chuyển cleanup vào `finally`/`using`; đồng thời bảo đảm writer/document được dispose khi generator ném exception.
 
-## 7. Cấu trúc file code
+### PDF-ADHOC-04 — output TMP có thể bị ghi đè khi chạy đồng thời
 
-| File | Namespace | Vai trò |
-|---|---|---|
-| `VieFUNDPdf/ClientReportAdhoc.cs` | `VieFUNDPdf` | Entry point, thread, switch/case dispatch |
-| `VieFUNDPdf/CReport.cs` | `VieFUNDPdf` | Toàn bộ hàm tạo PDF (~9,200 dòng) |
-| `PdfBase/PdfBuilder.cs` | `PdfBase` | Utility tạo/merge PDF (iTextSharp wrapper) |
+`UBReportPdfObjTMPAdd` upsert theo `(iUserID, iType)`, không theo request ID. Hai report cùng user và type chạy chồng nhau có thể thay output của nhau. Cần xác minh UI có khóa concurrent request hay không; nếu không, nên bind object với request/token.
 
----
+### PDF-ADHOC-05 — namespace bảng TMP không nhất quán trong SQL snapshot
 
-## 8. Xử lý lỗi và hủy
+`UBReportRequestTMP` dùng tên `dbo.UB_Report*TMP`, còn `UBReportRequestTMPEnd` dùng `VieFUNDTMP.dbo.UB_Report*TMP`. Tương tự Settlement, cần kiểm tra synonym/duplicate objects trên DB thật trước khi kết luận lỗi runtime.
 
-- **Hủy giữa chừng**: `m_Abort = true` → vòng lặp client sẽ phát hiện và thoát với `iRet = 2`.
-- **Exception**: bắt tại `CreatePdfObjClientReportAdhoc()` L299, gọi `m_ErrorCallback(ex)`.
-- **iRet conventions**:
+## 8. Cách thêm report type an toàn
 
-| Giá trị | Ý nghĩa |
-|---|---|
-| `0` | Thành công |
-| `1` | Lỗi lưu PDF |
-| `2` | Bị hủy bởi user |
+1. Xác định type ID không trùng trong UI/DB/router.
+2. Tạo DataSet method với SP và `RecType` contract rõ ràng.
+3. Tạo generator trả `byte[]`; test rỗng, một trang và nhiều trang.
+4. Thêm dispatch **một nơi dùng chung** cho memory/file mode; nếu chưa refactor thì cập nhật cả hai switch.
+5. Thêm option UI và kiểm tra key reader/writer.
+6. Test `1`, `5`, `6` và `>6` client để đi qua cả hai mode.
+7. Test abort/exception, temp-file cleanup và concurrent request cùng user.
+8. Test EN/FR, duplex, split dealer, disclosure và chart nếu report dùng.
+9. Xác minh output tải đúng user/request và không lộ dữ liệu giữa session.
 
----
+## 9. Source và tài liệu liên quan
 
-## 9. Sơ đồ kiến trúc module
-
-```
-┌─────────────────────────────────────────────────────┐
-│                     WebApp Layer                    │
-│  ClientStatement.aspx                               │
-│  ├── Chọn Report Type, Date Range, Client List      │
-│  ├── Gọi SP: UBReportAdd                            │
-│  └── Poll kết quả → Download PDF từ TMP             │
-└──────────────────────┬──────────────────────────────┘
-                       │ Request ID
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│               VieFUNDPdf Layer                      │
-│  CReport (partial)                                  │
-│  ├── ClientReportAdhoc.cs                           │
-│  │    ├── StartCreatePdfObjClientReportAdhoc()      │
-│  │    ├── CreatePdfObjClientReportAdhoc()           │
-│  │    ├── CreatePdfObjClientReportAdhocMemory()     │
-│  │    └── CreatePdfObjClientReportAdhocFile()       │
-│  └── CReport.cs                                     │
-│       ├── ClientAccountStatementPdfObj_XIRR()       │
-│       ├── ClientAccountStatementPdfObj_XIRROne()    │
-│       ├── ClientInvestorStatementPdfObj_XIRR()      │
-│       ├── ClientCommissionOne()                     │
-│       └── ClientInvestmentPerformanceOne()          │
-└──────────────────────┬──────────────────────────────┘
-                       │ DataSet
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│                    Database Layer                   │
-│  UBReportRequestTMP → ClientList + Options + Dates  │
-│  DSClientAccountStatement_XIRR → Portfolio data     │
-│  UBReportRequestTMPEnd → Mark complete              │
-│  SavePdfObj2TMP → Store final PDF bytes             │
-└─────────────────────────────────────────────────────┘
-```
+- [`ClientReportAdhoc.cs`](../../../VieFUNDPdf/ClientReportAdhoc.cs)
+- [`CReport.cs`](../../../VieFUNDPdf/CReport.cs)
+- [`PopupClientReportTypes.aspx.cs`](../../../WebApp/Main/PopupClientReportTypes.aspx.cs)
+- [Report Catalog](report-catalog.md)
+- [PDF Workflow](../../viefund-framework/pdf/pdf-workflow.md)
+- [Charts](../../viefund-framework/charts.md)

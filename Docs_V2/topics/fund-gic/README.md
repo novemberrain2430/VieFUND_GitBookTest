@@ -2,7 +2,9 @@
 
 > Quỹ đầu tư (Mutual Fund definitions, NAV, MER) và GIC (Guaranteed Investment Certificate).
 
-## Trạng thái: 📝 Chưa có nội dung
+## Trạng thái: ✅ Có module guide
+
+- [Module Guide](module-guide.md) — fund definition, NAV, pricing, GIC/CANNEX và điểm giao với trading/compliance.
 
 ### Key Files trong codebase
 

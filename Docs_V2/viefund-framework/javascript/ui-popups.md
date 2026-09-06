@@ -47,6 +47,8 @@ function OnAddTradeDlg(Lg, Options) {
 **Lưu ý quan trọng về định danh (Window Name `wname`):** 
 `wname` (`'VieFUND'` hoặc `'VieFUND1'`) quyết định cửa sổ popup sẽ ghi đè lên cửa sổ popup cũ (nếu cùng tên), hay tạo ra một instance hoàn toàn mới. Ví dụ: Để mở song song 2 popup, chúng phải có tên khác nhau.
 
+**Giới hạn đã xác minh trong source hiện tại:** `PopupModalLessWindow` quản lý ba cấp `VieFUND`/`VieFUND1`/`VieFUND2`; đối số `params` không được dùng và `resizable` không thay đổi feature string vì helper luôn mở `resizable=yes`. Nếu cần truyền dữ liệu, hãy nối query parameter đã encode vào `pageLink` hoặc dùng contract opener/hidden field đang có. Xem bản đồ đầy đủ tại [UI Patterns](../ui-patterns.md).
+
 ## 3. Quản lý trạng thái con trỏ (Loading Cursors)
 Khi cần thông báo hệ thống đang xử lý thay vì dùng overlay spinner, VieFUND sử dụng con trỏ chuột:
 ```javascript

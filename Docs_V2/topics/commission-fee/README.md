@@ -2,7 +2,9 @@
 
 > Hoa hồng (trailing commission, DSC, front-end load) và phí (management fee, advisory fee, fee redemptions).
 
-## Trạng thái: 📝 Chưa có nội dung
+## Trạng thái: ✅ Có module guide
+
+- [Module Guide](module-guide.md) — hai luồng Commission/Fee, processing pipeline, cấu hình và stored procedure chính.
 
 ### Key Files trong codebase
 

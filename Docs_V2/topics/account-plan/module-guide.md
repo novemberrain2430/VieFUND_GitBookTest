@@ -46,7 +46,7 @@ Bảng DB: `tPlan`, `tFundAccount`, `tFundPosition`, `tPlanBeneficiary`, `tPlanJ
 |---|---|
 | **Định danh** | `iPlanID`, `DealerAccountID`, `AccountType`, `FSCode` |
 | **Client liên quan** | `iClientID`, `iRepID`, `iSpouseID` |
-| **Designation** | `AccountDesignation` (1=Client Name, 2=Nominee, 3=Trustee...) |
+| **Designation** | `AccountDesignation` (1=Client Name, 2=Nominee, 3=Intermediary trong Order/report SQL hiện hành) |
 | **Trạng thái** | `Status` (A=Active, T=Terminated), `StartDate`, `EndDate` |
 | **Joint** | `JointType`, `JointSignatureOpt` |
 | **RESP** | `RecipientCode`, `bRESPSiblingFlag` |

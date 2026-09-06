@@ -1,4 +1,4 @@
-ETF Transfer
+﻿ETF Transfer
 
 ETF is traded on stock exchange, unlike mutual fund, the trades do not go through FundServ, instead it goes via a third-party stock trading company where the trades are forwarded to the stock exchange.
 
@@ -8,7 +8,7 @@ Dealer has one account at the trading company. It calls omnibus account.
 
 All orders from each client might be bundled in one order if they have the same characteristic: the same symbol, the same properties.
 
-Orders can be Buy or Sell so we do not use all “order side”
+Orders can be Buy or Sell so we do not use all �order side�
 
 Order Side: UB\_Def\_StockSide
 
@@ -18,7 +18,7 @@ Order TimeInForce: table UB\_Def\_StockTimeInForce: our dealers use only: Day, G
 
 The order is always in whole unit. No fraction.
 
-All ETF products define in our system with MgmtCode \= “ETF” which we made it up and the FundID is the Symbol of the ETF product. Only the Symbol (or also called Ticker) and the CUSIP number are important for any stock.
+All ETF products define in our system with MgmtCode \= �ETF� which we made it up and the FundID is the Symbol of the ETF product. Only the Symbol (or also called Ticker) and the CUSIP number are important for any stock.
 
 Transfer: 
 
@@ -58,7 +58,7 @@ Transferred amount \= transferred units x price
 
 Average cost is the last average cost from the account.
 
-When user click OK, a validation has to be performed to make sure the units are good… cannot be more than what the client has in the from side.
+When user click OK, a validation has to be performed to make sure the units are good� cannot be more than what the client has in the from side.
 
 Two-sided Trxs to be created: Transfer out of the from side and Transfer in in the to side
 
@@ -66,7 +66,7 @@ The trx type can be Internal transfer or External transfer. Each dealer might wa
 
 Best to create a function GetETFTransferType(@DSID) and return either 39 external Trnsf in or 42 Internal Transfer in, when 39 then 62 and when 42 then 65 accordingly
 
-If the ETF account in the “To” side does not exist, create one.
+If the ETF account in the �To� side does not exist, create one.
 
 The rules are the same as the existing manual transfer of the mutual funds.
 

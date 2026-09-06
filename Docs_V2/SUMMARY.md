@@ -3,6 +3,7 @@
 ## Getting Started
 
 * [Giới thiệu](README.md)
+* [Rà soát tổng thể & Checklist](project-audit-checklist.md)
 * [System Map](getting-started/system-map.md)
 * [Domain Glossary](getting-started/domain-glossary.md)
 
@@ -15,6 +16,8 @@
   * [Module Guide](topics/account-plan/module-guide.md)
 * [Trading & Orders](topics/trading-orders/README.md)
   * [Module Guide](topics/trading-orders/module-guide.md)
+  * [Order end-to-end](topics/trading-orders/order-end-to-end.md)
+  * [Order Code Dictionary](topics/trading-orders/code-dictionary.md)
 * [FundServ](topics/fundserv/README.md)
   * [Files DataFlow](topics/fundserv/files-dataflow.md)
   * [TFS NFU Flow](topics/fundserv/tfs-nfu-flow.md)
@@ -30,14 +33,18 @@
 * [Fund & GIC](topics/fund-gic/README.md)
   * [Module Guide](topics/fund-gic/module-guide.md)
 * [Compliance](topics/compliance/README.md)
+  * [Module Guide](topics/compliance/module-guide.md)
 * [Tax & Year-End](topics/tax-yearend/README.md)
+  * [Module Guide](topics/tax-yearend/module-guide.md)
 * [Settlement](topics/settlement/README.md)
 * [Security](topics/security/README.md)
+  * [Module Guide](topics/security/module-guide.md)
   * [Implementation Plan](topics/security/implementation-plan.md)
   * [Red Sentry Report](topics/security/red-sentry-report.md)
   * [Solved Result](topics/security/solved-result.md)
   * [Upload Audit](topics/security/upload-audit.md)
 * [PDF & Reports](topics/pdf-reports/README.md)
+  * [Report Catalog](topics/pdf-reports/report-catalog.md)
   * [Client Report Ad-hoc](topics/pdf-reports/client-report-adhoc.md)
 * [Onboarding](topics/onboarding/README.md)
 
@@ -63,9 +70,11 @@
 
 * [Tổng quan Reference](reference/README.md)
 * [Data Dictionary](reference/data-dictionary.md)
+* [ERD - 12 bảng cốt lõi](reference/12 bảng cốt lõi.md)
 * [SP Catalog](reference/sp-catalog/README.md)
 * [Screen Catalog](reference/screen-catalog.md)
 * [Traceability Matrix](reference/traceability-matrix.md)
+* [XML Schema & Validation](reference/xml-validation-guide.md)
 
 ## Business Logic Topics
 

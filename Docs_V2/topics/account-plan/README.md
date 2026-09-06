@@ -2,7 +2,9 @@
 
 > Tài khoản đầu tư (Plan) — RRSP, TFSA, RRIF, FHSA, OPEN, RESP, LIRA... và quan hệ Client → Plan → Fund Position.
 
-## Trạng thái: 📝 Chưa có nội dung
+## Trạng thái: ✅ Có module guide
+
+- [Module Guide](module-guide.md) — mô hình Client → Plan → account/position, plan types, tạo/sửa plan và các stored procedure chính.
 
 ### Key Files trong codebase
 

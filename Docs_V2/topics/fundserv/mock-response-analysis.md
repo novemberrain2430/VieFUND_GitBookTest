@@ -77,20 +77,19 @@ Từ `FFImport.GetFirstFileNameX()` (L1240+), service tìm file bằng cách:
     </Ntwrk>
     <MsgType>
       <OrdRspn>
-        <ActnCode>PUR</ActnCode>          <!-- PUR/RED/SW/TFR -->
+        <ActnCode>NEW</ActnCode>          <!-- phản chiếu ActnCode của order: NEW/CHG/CAN/CAX/REV/AOT -->
         <SrcID>SRC00001</SrcID>           <!-- Source ID from original order -->
         <FundAcctID>ACCT12345</FundAcctID>
         <OrdID>ORD123456789</OrdID>
         <TradeDate>20260430</TradeDate>
         <SettlDate>20260502</SettlDate>
-        <RtnCode>00</RtnCode>             <!-- 00=Accept, 01+=Reject -->
+        <RtnCode>00</RtnCode>             <!-- 00=Accept; 01=warning theo comment SP; 99=error -->
         <RspnSrc>M</RspnSrc>             <!-- M=Manufacturer, N=Network -->
         <DlrCode>5678</DlrCode>
 
-        <!-- Chỉ khi RtnCode != 00 (Rejected) -->
+        <!-- Reject khi có ErrorCode và RtnCode != 00, hoặc RtnCode=99 -->
         <!-- <Reject>
-          <ErrorCode>E001</ErrorCode>
-          <ErrorCode>E002</ErrorCode>
+          <ErrorCode>...</ErrorCode> <!-- dùng mã có thật trong UB_Def_FSRVError của môi trường test -->
         </Reject> -->
       </OrdRspn>
     </MsgType>
@@ -121,8 +120,8 @@ COrder.ImportXML() (L168)
 │   │
 │   └── <ErrorSet> → ProcessXMLErrorSet()
 │       └── GetErrorSet() — Parse NtwrkError
-│           ├── ErrorCode 98+003 → DB busy, retry
-│           └── ErrorCode 99    → Schema error
+│           ├── RtnCode 98 + ErrorCode 003 → DB busy/retry theo SQL
+│           └── ErrorCode 99 → nhánh schema/network error trong C# hiện tại
 │               └── SP: "UBXMLRecOrderRespnProcessError"
 │
 └── FFImport.ImportFileEnd() — SP: "UBFF_End" — Cập nhật status file import
@@ -155,12 +154,12 @@ COrder.ImportXML() (L168)
         <ActnCode>NEW</ActnCode>          <!-- NEW/CHG/DEL -->
         <SrcID>NFUSRC001</SrcID>          <!-- Source ID from original NFU -->
         <FundAcctID>ACCT12345</FundAcctID>
-        <RtnCode>00</RtnCode>             <!-- 00=Accept, 01+=Reject -->
+        <RtnCode>00</RtnCode>             <!-- Không được mặc định coi mọi code từ 01 trở lên là Reject; đối chiếu SP NFU -->
         <RspnSrc>M</RspnSrc>
 
         <!-- Chỉ khi RtnCode != 00 -->
         <!-- <Reject>
-          <ErrorCode>E100</ErrorCode>
+          <ErrorCode>...</ErrorCode> <!-- mã phải lấy từ DB/schema của môi trường test -->
         </Reject> -->
       </Rspn>
     </MsgType>
@@ -203,7 +202,7 @@ Quy trình test không bị ảnh hưởng bởi T+1 vì:
 1. Bạn **tự tạo** file response (thay vì đợi Manufacturer)
 2. Bạn **tự điền** ngày trong XML
 3. Import pipeline **không enforce** business rules về timing
-4. SP chỉ match response với order gốc qua `SrcID` + `DlrCode`
+4. SP ưu tiên match qua `SrcID` + `MgmtCode` trong `UB_OrderSent`; fallback còn xét `DlrCode`, action và cửa sổ ngày
 
 ---
 
@@ -257,7 +256,7 @@ Ví dụ: `DR5678FSRV.20260430AAA9.Z01`
     </MsgCreate>
     <MsgType>
       <OrdRspn>
-        <ActnCode>PUR</ActnCode>
+        <ActnCode>NEW</ActnCode>
         <SrcID>SRC00001</SrcID>
         <FundAcctID>ACCT12345</FundAcctID>
         <OrdID>MOCK-ORD-001</OrdID>
@@ -320,7 +319,8 @@ Ví dụ: `XR5678FSRV.20260430AAA9.Z01`
 EXEC UBFF_List @iOptions=0, @iPageSize=50, @iPage=0
 
 -- Xem order status đã thay đổi chưa
--- (Sau khi DR import, order phải chuyển từ Waiting → Confirmed/Rejected)
+-- (Sau DR import, order thường chuyển Pending to Receive → Accepted/Rejected;
+--  Contracted/Confirmed đến từ confirmation/settlement import)
 ```
 
 ---
@@ -334,19 +334,18 @@ EXEC UBFF_List @iOptions=0, @iPageSize=50, @iPage=0
 <RspnSrc>M</RspnSrc>
 <!-- Không có <Reject> -->
 ```
-**Kỳ vọng**: Order status → Confirmed
+**Kỳ vọng**: Order status → Accepted (`iOrderStatus=4`), chưa phải Confirmed.
 
-### 5.2 Reject (RtnCode=01+)
+### 5.2 Reject
 
 ```xml
 <RtnCode>01</RtnCode>
 <RspnSrc>M</RspnSrc>
 <Reject>
-  <ErrorCode>E001</ErrorCode>
-  <ErrorCode>E002</ErrorCode>
+  <ErrorCode>...</ErrorCode>
 </Reject>
 ```
-**Kỳ vọng**: Order status → Rejected, error codes lưu trong DB
+**Kỳ vọng**: Với response chuẩn, SQL reject khi có `ErrorCode1` và `RtnCode <> 00`, hoặc khi `RtnCode=99`; error codes được lưu trong DB. Mã cụ thể phải lấy từ `UB_Def_FSRVError` của môi trường test, không dùng `E001/E002` như mã chuẩn suy đoán.
 
 ### 5.3 Warning
 
@@ -354,10 +353,10 @@ EXEC UBFF_List @iOptions=0, @iPageSize=50, @iPage=0
 <RtnCode>00</RtnCode>
 <RspnSrc>M</RspnSrc>
 <Warning>
-  <ErrorCode>W001</ErrorCode>
+  <ErrorCode>...</ErrorCode>
 </Warning>
 ```
-**Kỳ vọng**: Order status → Confirmed (nhưng có warning)
+**Kỳ vọng**: Order status → Accepted, bật warning và lưu warning detail; chưa chuyển Confirmed.
 
 ### 5.4 Network Error (ErrorSet)
 
@@ -367,7 +366,7 @@ EXEC UBFF_List @iOptions=0, @iPageSize=50, @iPage=0
   <NtwrkError>
     <RspnSrc>N</RspnSrc>
     <RtnCode>99</RtnCode>
-    <ErrorCode>999</ErrorCode>
+    <ErrorCode>99</ErrorCode>
     <CorrlatnID>414D51...</CorrlatnID>
   </NtwrkError>
 </ErrorSet>

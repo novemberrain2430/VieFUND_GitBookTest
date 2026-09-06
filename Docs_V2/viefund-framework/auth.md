@@ -336,8 +336,8 @@ CFunctions.GetSessionValue(this, -1, "TMPUserAdmin")
 |---|---|---|
 | `iLoginID` | global (no prefix) | ID của login session, dùng làm namespace |
 | `TMPDBID` | string | Connection string ID đến DB |
-| `TMPDSID` | string | Dealer/Sub-dealer ID |
-| `TMPDSIDSub` | string | Sub-dealer ID |
+| `TMPDSID` | string | Dealership context; có thể gồm member-group prefix với giá trị > 10000 |
+| `TMPDSIDSub` | string | Sub-site/customization suffix; chưa có bằng chứng là khóa data isolation |
 | `TMPiMemberID` | int | User's member record ID |
 | `TMPLoginID` | string | Username đã login |
 | `TMPUserName` | string | Full name (FirstName + LastName) |

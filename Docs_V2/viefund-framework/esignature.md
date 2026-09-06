@@ -43,7 +43,7 @@ User login → ESignature.GetESignatureSourceType(DBIDStr, UserID)
 │  BLL Layer                                          │
 │  ├── UBClasses/ESignature.cs  — Provider routing    │
 │  ├── UBClasses/Forms.cs       — Envelope CRUD       │
-│  └── UBClasses/CPlanDoc.cs    — E-Sign doc queries  │
+│  └── UBClasses/Document.cs    — class CPlanDoc, E-Sign doc queries │
 ├─────────────────────────────────────────────────────┤
 │  Provider Libraries                                 │
 │  ├── VFDocSign/CVFDocSign.cs  (109KB) — DocuSign    │
@@ -239,6 +239,93 @@ PopupForms.OnEnvSignorityPendingSendBtn()
 CSignority Signority = new CSignority(DBIDStr, DSIDStr, iUserID);
 bSuccess = Signority.SyncEnvelope(iEnvelopeID, ref errorMessage, ref bEnvelopeChanged, Lg, true);
 ```
+Ở Giao Diện
+
+Có 2 nơi chính:
+
+
+Trang eSign document / Compliance document list
+
+Link: Synchronize with Signority tại DocViewBody.aspx (line 1529).
+
+Handler: ComplianceDocView.aspx.cs (line 3162) → OnSyncEnvelope().
+
+
+
+Popup danh sách envelope đã gửi
+
+Link/icon refresh: Synchronize with Signority tại PopupForms.aspx (line 529) và PopupForms.aspx (line 531).
+
+Handler: PopupForms.aspx.cs (line 1250) → hidden button → PopupForms.aspx.cs (line 1298) → EnvelopeRefreshSignority().
+
+
+
+Luồng Cũ Chạy Như Sau
+Người dùng bấm Synchronize with Signority, rồi nếu envelope trên Signority đã COMPLETED thì code mới tự download ZIP và ghi PDF về VieFUND.
+
+UI gọi sync:
+
+OnSyncEnvelope() hoặc OnSignorityEnvSentRefresh() lấy selected envelope ID.
+
+
+
+Code gọi:
+
+CSignority.SyncEnvelope(...) tại CSignority.cs (line 304).
+
+
+
+SyncEnvelope():
+
+
+GetClient() đọc Signority config, gồm DocApiUrl, ở CSignority.cs (line 608).
+
+Gọi Signority API lấy envelope/document status.
+
+Save status về DB.
+
+Update recipient statuses.
+
+Nếu bAlwaysDownLoad == true hoặc status/recipient changed thì gọi DownloadDocuments().
+
+
+
+
+DownloadDocuments() tại CSignority.cs (line 691):
+
+
+Chỉ download nếu Signority status là COMPLETED.
+
+URL lấy từ m_DocApiUrl, default là content=archive.
+
+Gọi HTTP GET bằng Basic Auth.
+
+Giả định response là ZIP.
+
+Unzip một lớp.
+
+Mỗi entry trong ZIP được đưa vào list Model.File { name, body }.
+
+
+
+
+SaveDocuments() tại CSignority.cs (line 773):
+
+
+Lấy lại DocList từ DB.
+
+Với mỗi document, lấy FormFileName.
+
+GetOneFile() tại CSignority.cs (line 746) chỉ tìm file tên FormFileName + ".pdf".
+
+Nếu tìm thấy thì ghi binary về DB bằng CDocumentObj.UpdateDocFileObj() tại CSignority.cs (line 825).
+
+Nếu không tìm thấy thì mark envelope error tại CSignority.cs (line 831).
+
+
+
+
+Nói ngắn gọn: luồng cũ là sync status + nếu completed thì download ZIP content=archive, unzip ra các file oldfilename.pdf, match theo tên, rồi update PDF body vào document object trong DB. Hiện nó chưa hỗ trợ _digital.pdf và chưa hỗ trợ zip lồng zip.
 
 SPs liên quan:
 - `UBSignorityEnvelopeListOneClient` — Danh sách envelopes theo client
@@ -409,14 +496,14 @@ CVFDocSign sigObj = new CVFDocSign();
 | `VFOneSpan/COneSpan.cs` | 35KB | OneSpan REST API wrapper |
 | `UBClasses/ESignature.cs` | 27KB | BLL — provider routing, status updates, settings |
 | `UBClasses/Forms.cs` | — | BLL — envelope CRUD, doc management |
-| `UBClasses/CPlanDoc.cs` | — | BLL — e-sign doc queries, Excel export |
+| `UBClasses/Document.cs` | — | BLL `CPlanDoc` — e-sign doc queries, Excel export |
 | `WebApp/Main/PopupForms.aspx.cs` | 103KB | UI — envelope send/receive cho client |
 | `WebApp/Main/ComplianceDocView.aspx.cs` | 198KB | UI — quản lý e-sign docs (search, sync, attach) |
 | `WebApp/Main/PopupMiscellaneousSetting.aspx.cs` | 143KB | UI — cài đặt API credentials |
 | `WebApp/Main/PopupMemberAdd.aspx.cs` | — | UI — check/add DocuSign user |
 | `WebApp/DocuSignCode.aspx.cs` | 2KB | OAuth callback page |
 | `WebApp/Main/DocuSignTest.aspx.cs` | — | Test page |
-| `VFDocSign/Example1-4.cs` | 12-91KB | DocuSign SDK examples (reference) |
+| `VFDocSign/Example1.cs`–`Example4.cs` | 12-91KB | DocuSign SDK examples (reference) |
 
 ### Dependencies (DLLs trong VFDocSign/)
 

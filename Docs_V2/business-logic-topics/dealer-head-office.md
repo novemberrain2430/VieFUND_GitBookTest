@@ -1,4 +1,4 @@
-**Dealership Head Office (Admin/Dealer)**
+﻿**Dealership Head Office (Admin/Dealer)**
 
 In this head office screen, there are 3 important properties:
 
@@ -12,7 +12,7 @@ PopupSetupDealer.aspx
 
 **\#1 Level:** there are 4 levels: level 1 and 2 are for introducing dealers, level 3 usually uses Trust Account (\#2) and level 4 are nominee dealers.
 
-**\#2 Trust Account**: the dealer has trust account for their clients. When doing a â€œbuyâ€ the client can pay (deposit) to the dealer and the dealer would settle the amount with the fund company. For example, John Doe writes a cheque to the dealer the amount of $10K to buy a fund DYN 3056\. The dealer cash the cheque and deposit Johnâ€™s Doe $ into the Trust Account, place the buy, and then later settle with the fund company the purchase amount. 
+**\#2 Trust Account**: the dealer has trust account for their clients. When doing a “buy” the client can pay (deposit) to the dealer and the dealer would settle the amount with the fund company. For example, John Doe writes a cheque to the dealer the amount of $10K to buy a fund DYN 3056\. The dealer cash the cheque and deposit John’s Doe $ into the Trust Account, place the buy, and then later settle with the fund company the purchase amount. 
 
 ![][image2]
 
@@ -28,7 +28,7 @@ Each dealer code has its own properties
 
 **General Info Tab:**
 
-â€œ**Real Time Trading**â€ trades of this dealer code can be sent to FundServ in real time instead of batch mode. The real time (interactive) communication between Dealer \<â€“\> FundServ \<-\> Fund Companies is done using IBM Message Queue, where FundServ is the server site and the dealership acts as client side. So on dealership side, a IBM MQ Client must be installed and dealer get certificate from FundServ to installed etc. A dealership can have dealer codes and real time and dealer codes not in real time. When it is not in real time, it calls batch mode, where the communication between Dealership \<-\> FundServ \<-\> Fund companies is via XML files transported using sftp.
+“**Real Time Trading**” trades of this dealer code can be sent to FundServ in real time instead of batch mode. The real time (interactive) communication between Dealer \<–\> FundServ \<-\> Fund Companies is done using IBM Message Queue, where FundServ is the server site and the dealership acts as client side. So on dealership side, a IBM MQ Client must be installed and dealer get certificate from FundServ to installed etc. A dealership can have dealer codes and real time and dealer codes not in real time. When it is not in real time, it calls batch mode, where the communication between Dealership \<-\> FundServ \<-\> Fund companies is via XML files transported using sftp.
 
 ![][image4]
 

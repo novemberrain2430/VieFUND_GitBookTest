@@ -1,4 +1,4 @@
-Set Ä‘Æ°á»ng dáº«n Ä‘áº¿n folder chá»©a máº«u pdf:
+﻿Set đường dẫn đến folder chứa mẫu pdf:
 
 ![][image1]
 
@@ -8,13 +8,13 @@ Client Form:
 
 ![][image3]
 
-Táº¥t cáº£ PDF Ä‘á»u gá»i vÃ o PDFView vÃ  truyá»n param vÃ o sau Ä‘Ã³ switch case trong Ä‘Ã³
+Tất cả PDF đều gọi vào PDFView và truyền param vào sau đó switch case trong đó
 
 ![][image4]
 
 ![][image5]
 
-Get full file path cá»§a template pdf á»Ÿ trong SP nÃ y:
+Get full file path của template pdf ở trong SP này:
 
 ![][image6]
 

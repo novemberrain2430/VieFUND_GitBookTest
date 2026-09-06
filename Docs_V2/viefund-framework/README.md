@@ -6,17 +6,21 @@
 
 | # | Guide | Nội dung | Trạng thái |
 |---|---|---|---|
-| 1 | [Auth](auth.md) | Login, SSO (SAML), 2FA (Twilio), Session management, Permissions | 📝 |
-| 2 | [UI Patterns](ui-patterns.md) | Page/Panel/Popup patterns, Menu system, Layout, _FR suffix | 📝 |
-| 3 | [JavaScript](javascript.md) | CommonFunctions.js (128KB), AJAX engine, client-side validation | 📝 |
-| 4 | [Database Access](database-access.md) | CDatabase.cs, CBase.cs, SP execution, transactions, multi-tenant | 📝 |
-| 5 | [Multi-tenancy](multitenancy.md) | DBID/DSID/DSIDSub, per-dealer CSS/logos, i18n (EN/FR) | 📝 |
-| 6 | [Email & Notifications](email-notifications.md) | SendEmail.cs (84KB), CMSG.cs templates, SMS via Twilio | 📝 |
-| 7 | [E-Signature](esignature.md) | DocuSign, Signority, OneSpan — khi nào dùng cái nào | 📝 |
-| 8 | [Charts](charts.md) | ASP.NET Chart Control, chart types, data binding | 📝 |
-| 9 | [Omnibus](omnibus/README.md) | VFOmnibus: Order lifecycle, Dividend, REV, Account Compare, Reports | ✅ |
+| 1 | [Auth](auth.md) | Login, SSO (SAML), 2FA (Twilio), Session management, Permissions | ✅ |
+| 2 | [UI Patterns](ui-patterns.md) | Page/Panel/Popup, include-based layout, menu, UpdatePanel, EN/FR | ✅ |
+| 3 | [JavaScript](javascript.md) | CommonFunctions.js, AJAX engine, client-side validation | ✅ |
+| 4 | [Database Access](database-access.md) | DBID/Registry, CDatabase API, SP/result contract, tenant, transaction và lỗi | ✅ |
+| 5 | [Multi-tenancy](multitenancy.md) | DBID/DSID, compound DSID, session scope, branding, settings và i18n EN/FR | ✅ |
+| 6 | [Email & Notifications](email-notifications.md) | Notification/outbox, SMTP, template EN/FR, SMS/2FA và vận hành | ✅ |
+| 7 | [E-Signature](esignature.md) | DocuSign, Signority, OneSpan — khi nào dùng cái nào | ✅ |
+| 8 | [Charts](charts.md) | Hai pipeline Web Forms/PDF, chart types, data contracts, binding và debug | ✅ |
+| 9 | [PDF Workflow](pdf/pdf-workflow.md) | Pipeline VieFUNDPdf, hai router PdfView, form/report/tax, lưu trữ và checklist debug | ✅ |
+| 10 | [Omnibus](omnibus/README.md) | VFOmnibus: Order lifecycle, Dividend, REV, Account Compare, Reports | ✅ |
+| 11 | [Onboarding](../topics/onboarding/README.md) | ASMX contract, client/plan/order import, manual approval, DB map và findings | ✅ |
 
-> 📝 = Placeholder — nội dung sẽ được viết dần.
+> ✅ = Có guide sử dụng được. 📝 = Placeholder cần viết tiếp.
+
+`VFCsvExport` và deliverable Export hiện được loại khỏi phạm vi theo yêu cầu của user.
 
 ## Tại sao tách riêng?
 
