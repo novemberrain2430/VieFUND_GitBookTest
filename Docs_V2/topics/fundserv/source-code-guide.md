@@ -1,425 +1,154 @@
-# VieFund AG – Hướng dẫn cấu trúc Source Code
+# Hướng dẫn source runtime Fundserv
 
-## 1. Tổng quan hệ thống
+Tài liệu này lập bản đồ entry point và ranh giới có thể truy vết trong repository. Quy ước nhãn và dẫn chứng theo [README](README.md); luồng chi tiết nằm tại [TFS/NFU flow](tfs-nfu-flow.md), vòng đời file tại [Files dataflow](files-dataflow.md).
 
-- **WebApp** là source code back office cho một công ty Dealer (VieFund) tại Canada.
-- Hệ thống quản lý đầu tư (mutual funds, GIC), khách hàng, giao dịch, hoa hồng, thuế và tuân thủ quy định.
-- Giao tiếp với **Fundserv** (mạng lưới trao đổi giao dịch mutual fund tại Canada) thông qua IBM MQ hoặc batch file.
-
----
-
-## 2. Kiến trúc tổng thể
-
-```
-VieFundAG/
-├── WebApp/              ← ASP.NET Web Forms (Front-end + Back-end logic)
-├── VieFUNDIE/           ← Windows Service (Import/Export engine)
-├── VieFUNDMQLib/        ← IBM MQ Library (compiled only, no source)
-├── Guide.md             ← File hướng dẫn này
-└── FundserV36.md        ← Tài liệu Fundserv Standards V36
-```
-
-### Luồng dữ liệu chính
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                WebApp (IIS Web Application)              │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │ .aspx/.aspx.cs (UI + Code-behind logic)            │  │
-│  │   PopupTradeAdd → Orders                           │  │
-│  │   PopupOrderBatch → CO file / MQ real-time         │  │
-│  │   PopupFundServ → File history/settings            │  │
-│  └────────────────┬───────────────────────────────────┘  │
-│                   │ DLLs (shared with service)           │
-│  ┌────────────────┴───────────────────────────────────┐  │
-│  │ UBClass.dll    → Business logic, PDF generation    │  │
-│  │ UBConnection.dll → Database access (SQL Server)    │  │
-│  │ UBStatic.dll   → Utility/helper classes            │  │
-│  │ UBFFImport.dll → File Format Import/Export engine  │  │
-│  │ VieFUNDPdf.dll → PDF report generation             │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-                       │ Shared DLLs: UBConnection, UBFFImport
-                       ▼
-┌──────────────────────────────────────────────────────────┐
-│           VieFUNDIE (Windows Service)                    │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │ UBImportFS class (VieFUNDIE.cs)                    │  │
-│  │   Timer loop (60s) → For each DSID:                │  │
-│  │     1. COrder.OrderFileGenerate()  → CO file       │  │
-│  │     2. CXM.FileGenerate()          → NFU/XM file   │  │
-│  │     3. CannexOrder.OrderFileGenerate() → GIC order  │  │
-│  │     4. FFImport.ProcessAllX()      → Import files  │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-              IBM MQ / File System
-                       │
-                       ▼
-              ┌───────────────┐
-              │   Fundserv    │
-              │   Network     │
-              └───────────────┘
-```
-
----
-
-## 3. VieFUNDIE – Windows Service (Import/Export Engine)
-
-### 3.1 Tổng quan
-
-| Thuộc tính | Giá trị |
-|---|---|
-| Tên service | `VieFund IE Service` |
-| Class chính | `UBImportFS` : `ServiceBase` |
-| Namespace | `VieFundIE` |
-| Framework | .NET Framework 4.5.2 |
-| Version hiện tại | `34.24.04.15` (Fundserv V34, ngày 2024-04-15) |
-| Run mode | `LocalSystem`, `Automatic` start |
-
-### 3.2 Source Files
-
-| File | Vai trò |
-|---|---|
-| `Program.cs` | Entry point – khởi tạo `UBImportFS()` và chạy service |
-| `VieFUNDIE.cs` (969 dòng) | **Logic chính**: Timer, LoadSettings, OnTimer, file I/O |
-| `VieFUNDIE.Designer.cs` | Designer auto-generated: Timer component, ServiceName |
-| `UBInstaller.cs` | Windows Service installer (InstallUtil) |
-| `App.config` | Cấu hình: `QUERYINTERVAL=60000` (60 giây), `DEBUGMODE=0` |
-
-### 3.3 Dependencies (DLL)
-
-| DLL | Nguồn | Vai trò |
-|---|---|---|
-| `UBConnection.dll` | `WebApp/bin/` | Kết nối SQL Server database, registry, XML helpers |
-| `UBFFImport.dll` | `WebApp/bin/` | **Core import/export engine** – parse và xử lý tất cả file Fundserv |
-| `UBStatic.dll` | `WebApp/bin/` | Utility functions |
-| `EPPlus.dll` | bundled | Excel export |
-
-### 3.4 Cơ chế hoạt động (Timer Loop)
-
-Service hoạt động dựa trên **timer loop** mỗi 60 giây (cấu hình `QUERYINTERVAL`):
-
-```csharp
-OnTimer() {
-    // 1. Lấy DBID tiếp theo (round-robin nếu multi-DB)
-    GetDBIDStr();
-    
-    // 2. Lấy danh sách DSID (dealership) từ DB
-    DSIDList = GetDSIDList();
-    
-    // 3. Với mỗi DSID:
-    foreach (DSID in DSIDList) {
-        LoadSettings(DSID);           // Đọc cấu hình từ DB
-        
-        if (IsIgnore(serverTime))     // Kiểm tra lịch nghỉ
-            continue;
-        
-        // === EXPORT (Dealer → Fundserv) ===
-        COrder.OrderFileGenerate();    // Sinh CO file từ pending orders
-        CXM.FileGenerate();            // Sinh NFU/Transfer file
-        CannexOrder.OrderFileGenerate(); // Sinh GIC order file
-        
-        // === IMPORT (Fundserv → Dealer) ===
-        FFImport.ProcessAllX();        // Import tất cả file nhận về
-    }
-}
-```
-
-### 3.5 Cấu hình thư mục (LoadSettings)
-
-Cấu hình lưu trong *database* (không phải App.config), đọc qua `GetVieFundIESettings()`:
-
-| Setting Key | Biến | Mô tả | Mặc định |
-|---|---|---|---|
-| `FILE_PATH` | `m_FilePath` | Thư mục chứa file **chờ import** (IN) | `{app}\FF` |
-| `FILE_PATH_IMPORTED` | `m_FileImportedPath` | File đã import thành công | `{FF}\Imported` |
-| `FILE_PATH_ERROR` | `m_FileErrorPath` | File bị lỗi | `{FF}\Error` |
-| `FILE_PATH_SKIPPED` | `m_FileSkippedPath` | File bị skip | `{FF}\Skipped` |
-| `FILE_PATH_UPLOAD` | `m_FileUploadPath` | Thư mục **ghi CO file** (OUT) | `{FF}\OUT` |
-| `GIC_FILE_PATH_UPLOAD` | `m_FileUploadPathGIC` | Thư mục ghi GIC order | `{OUT}\GIC` |
-| `FILE_ENCODING` | `m_FileEncoding` | Encoding file (Windows-1252) | `1252` |
-| `NO_RUNTIME` | `m_No_RunTime` | Giờ nghỉ (VD: `0:00-4:00,22:00-23:59`) | |
-| `NO_WRUNDAY` | `m_No_WRunDay` | Ngày nghỉ trong tuần (VD: `7,1` = Sat,Sun) | |
-| `NO_MRUNDAY` | `m_No_MRunDay` | Ngày nghỉ trong tháng | |
-
-### 3.6 Cấu trúc thư mục file trên server
-
-```
-{FILE_PATH}/                    ← Incoming files from Fundserv
-├── Imported/                   ← Successfully processed
-│   ├── COM/                    ← Commission files
-│   ├── TRX/                    ← Transaction files (TS/HS)
-│   ├── FUND/                   ← Fund definition files (FD)
-│   └── PRICE/                  ← Price/NAV files
-├── Error/                      ← Files that failed processing
-├── Skipped/                    ← Files that were skipped
-└── OUT/                        ← Outgoing files to Fundserv
-    └── GIC/                    ← GIC-specific orders
-```
-
-### 3.7 Quy trình Export – Cách sinh CO file
-
-**CO (Confirmation Order)** file là file lệnh giao dịch Dealer gửi tới Fundserv:
-
-1. **User tạo trade** trong WebApp → `PopupTradeAdd.aspx.cs` → lưu vào DB với status = **Pending**
-2. **User xét duyệt batch** → `PopupOrderBatch.aspx.cs`:
-   - Tab Pending: Xem danh sách orders → Tag → Click "Generate Order"
-   - Có 2 mode gửi:
-     - **Real-time** (`rdModeRT`): `CTrx.OrderPendingMove2Waiting()` → VieFUNDMQLib gửi qua IBM MQ
-     - **Batch** (`rdModeBatch`): `CTrx.OrderPendingMove2Waiting()` → Đánh dấu "waiting" trong DB
-3. **VieFUNDIE service** (timer loop mỗi 60s):
-   - Gọi `UBFFImport.COrder.OrderFileGenerate()` → Đọc orders "waiting" từ DB → Generate XML CO file → Ghi ra `FILE_PATH_UPLOAD`
-   - Gọi `UBFFImport.CXM.FileGenerate()` → Generate NFU (Non-Financial Update) files
-   - Gọi `UBFFImport.CannexOrder.OrderFileGenerate()` → Generate GIC order files
-
-### 3.8 Quy trình Import – Cách nhận và xử lý file
-
-**TS, HS, NS, PS, GS, FD, MD...** là file Manufacturer gửi cho Dealer qua Fundserv:
-
-1. File được Fundserv đặt vào thư mục `FILE_PATH` (hoặc gửi qua MQ)
-2. **VieFUNDIE service** timer loop:
-   - Gọi `UBFFImport.FFImport.ProcessAllX()` → Quét thư mục `FILE_PATH`
-   - Parse từng file XML dựa trên `m_FileCodeList` (ánh xạ file type → handler)
-   - Import data vào database
-   - Di chuyển file xong sang `FILE_PATH_IMPORTED/{subdir}/{filename}`
-   - File lỗi → `FILE_PATH_ERROR`
-   - File skip → `FILE_PATH_SKIPPED`
-3. **WebApp** hiển thị kết quả:
-   - `PopupFundServ.aspx` → Tab History: xem danh sách file đã import/lỗi
-   - `PopupFundServ.aspx` → Tab Error Log: xem chi tiết lỗi, map lại Dealer/Rep code
-
-### 3.9 Lịch trình hoạt động (IsIgnore)
-
-Service tự động nghỉ trong các trường hợp:
-- **Chủ nhật trước 7AM**: Luôn bỏ qua
-- **NO_RUNTIME**: Khoảng thời gian cấu hình (mặc định `0:00-4:00` và `22:00-23:59`)
-- **NO_WRUNDAY**: Ngày trong tuần (1=CN, 2=T2...7=T7)
-- **NO_MRUNDAY**: Ngày cụ thể trong tháng
-- **Midnight (23:57 - 00:02)**: Luôn bỏ qua
-- **Ngoại lệ**: Luôn chạy vào khoảng ngày thứ 59-64 trong năm (cuối Feb/đầu Mar – deadline year-end)
-
-### 3.10 Quản lý service
-
-| Batch file | Lệnh |
-|---|---|
-| `Run_VieFundIE_Service.bat` | Cài đặt và chạy service |
-| `Stop_VieFundIE_Service.bat` | Dừng service |
-| `Remove_VieFundIE_Service.bat` | Gỡ cài đặt service |
-
----
-
-## 4. VieFUNDMQLib – IBM MQ Library
-
-### 4.1 Tổng quan
-
-`VieFUNDMQLib` là thư viện **kết nối IBM WebSphere MQ** (Message Queue) để giao tiếp real-time với Fundserv.
-
-- **Chỉ có compiled binaries** (bin/, obj/) – **không có source code** trong thư mục này.
-- Thư viện này được WebApp sử dụng (có thể thông qua DLLs trong WebApp/bin/) cho chế độ gửi **real-time**.
-- Cấu hình MQ nằm trong database, quản lý qua `PopupFundServ.aspx.cs` (tab Settings).
-
-### 4.2 Cấu hình MQ (Production)
-
-Được set trong WebApp → PopupFundServ → Settings:
-
-| Setting Key | UI Control | Mô tả |
-|---|---|---|
-| `MQ_HOSTNAME` | `idMQHostName` | Hostname MQ Server |
-| `MQ_PORTNUMBER` | `idMQPortNumber` | Port number |
-| `MQ_CHANNEL` | `idMQChannelName` | Channel name |
-| `MQ_MANAGER` | `idMQManagerName` | Queue Manager name |
-| `MQ_NAMESEND` | `idMQNameSend` | Queue name cho **gửi** (CO orders) |
-| `MQ_NAMERESPONSE` | `idMQNameResponse` | Queue name cho **nhận** (responses) |
-| `MQ_TIMERINTERVAL` | `idMQTimerInterval` | Polling interval |
-| `MQ_CHARACTERSET` | `idMQCharacterSet` | Character set |
-| `MQ_SSLUSED` | `chMQSSLUsed` | Có dùng SSL không |
-| `MQ_SSLKEYPATH` | `idMQSSLKeyPath` | SSL key file path |
-| `MQ_LABEL` | `idMQLabel` | Label |
-| `MQ_SENDSTARTTIME` | `cbMQStartTime` | Giờ bắt đầu gửi |
-| `MQ_SENDSTOPTIME` | `cbMQStopTime` | Giờ ngừng gửi |
-| `MQ_SENDWEEKEND` | `chMQIncludeWeekend` | Có gửi cuối tuần không |
-
-### 4.3 Cấu hình MQ (Testing)
-
-Hỗ trợ môi trường test song song (suffix `_T`): `MQ_HOSTNAME_T`, `MQ_CHANNEL_T`, v.v.
-
-### 4.4 Cấu hình MQ Extra (Thứ 3)
-
-Hỗ trợ kết nối MQ bổ sung (suffix `2`): `MQ_HOSTNAME2`, `MQ_CHANNEL2`, v.v.
-
-### 4.5 Run Mode
-
-| Mode | Giá trị | Mô tả |
-|---|---|---|
-| Production | `MQ_RUNOPT` | Chỉ dùng MQ Production |
-| Test | `MQ_RUNOPT` | Chỉ dùng MQ Test |
-| Concurrent | `MQ_RUNOPT` | Dùng cả 2 đồng thời |
-
----
-
-## 5. WebApp – ASP.NET Web Forms Application
-
-### 5.1 Tổng quan
-
-| Thuộc tính | Giá trị |
-|---|---|
-| Framework | ASP.NET Web Forms (.NET Framework) |
-| Ngôn ngữ | C# |
-| UI | `.aspx` pages + Ajax Control Toolkit |
-| Bilingual | EN (English) + FR (French – suffix `_FR`) |
-| Solution file | `WebApp.sln` |
-
-### 5.2 Cấu trúc thư mục
-
-```
-WebApp/
-├── Default.aspx / .cs          ← Login page
-├── Main/                       ← Tất cả trang chức năng chính
-│   ├── Client.aspx / .cs       ← Trang khách hàng (master page)
-│   ├── PopupTradeAdd.aspx/.cs  ← Popup nhập lệnh giao dịch
-│   ├── PopupOrderBatch.aspx/.cs← Popup quản lý đơn hàng batch
-│   ├── PopupFundServ.aspx/.cs  ← Popup quản lý Fundserv I/E
-│   ├── CommissionView.aspx/.cs ← Quản lý hoa hồng
-│   ├── FundSetup.aspx/.cs      ← Cài đặt thông tin quỹ
-│   ├── YearEnd.aspx/.cs        ← Year-end tax processing
-│   ├── TrxView.aspx/.cs        ← Xem transactions
-│   ├── SettlementView.aspx/.cs ← Xem settlement data
-│   ├── AccountView.aspx/.cs    ← Xem danh mục tài khoản
-│   ├── OnBoardView.aspx/.cs    ← Onboarding workflow
-│   ├── RESPView.aspx/.cs       ← RESP management
-│   ├── Panel*.aspx/.cs         ← Các panel con (embedded controls)
-│   ├── Popup*.aspx/.cs         ← Các popup dialog
-│   └── *_FR.aspx               ← Bản tiếng Pháp
-├── bin/                        ← Compiled DLLs
-├── Css/                        ← Stylesheets
-├── Js/                         ← JavaScript files
-├── Img/                        ← Images
-├── Inc/                        ← Server-side includes
-├── Controls/                   ← User controls (.ascx)
-├── Cert/                       ← SSL certificates
-├── Fonts/                      ← Web fonts
-└── Plugins/                    ← Third-party plugins
-```
-
-### 5.3 Shared DLL Libraries (WebApp/bin/)
-
-| DLL | Chức năng |
-|---|---|
-| **UBClass.dll** (1.6MB) | Business logic: CTrx (transactions), CNFU (NFU), Fee, Intermediary, CPlanDoc |
-| **UBConnection.dll** (67KB) | Database access layer (SQL Server), CDatabase, CRegistry |
-| **UBStatic.dll** (172KB) | Static helpers: CFunctions, CBase, CMSG, CMember |
-| **UBFFImport.dll** (216KB) | Fundserv file import/export: FFImport, COrder, CXM, CannexOrder |
-| **UBExport.dll** (213KB) | Data export utilities |
-| **VieFUNDPdf.dll** (930KB) | PDF report generation: tax slips, trade confirmations |
-| **VieFUNDOnBoarding.dll** (152KB) | Client onboarding workflow |
-| **VFOmnibus.dll** (56KB) | Omnibus account processing |
-| **VFFundata.dll** (31KB) | Fundata integration |
-| **VFDocSign.dll** (40KB) | Document signing integration |
-| **VFSignority.dll** (53KB) | Signority e-signature integration |
-| **VFOneSpan.dll** (23KB) | OneSpan e-signature integration |
-| **VieFUNDSaml.dll** (70KB) | SAML SSO authentication |
-| **VieFUNDSmS.dll** (11KB) | SMS notifications |
-| **PdfBase.dll** (1.8MB) | PDF rendering engine |
-| **EPPlus.dll** (1.3MB) | Excel file generation |
-
-### 5.4 Các chức năng chính
-
-| Module | Files chính | Mô tả |
-|---|---|---|
-| Client Management | `Client.aspx`, `PopupClientAdd.aspx`, `PanelKYCExtra.aspx` | Quản lý khách hàng, KYC |
-| Account/Plan | `PopupPlanAdd.aspx`, `PopupAccountAdd.aspx`, `AccountView.aspx` | Tài khoản đầu tư |
-| Trading | `PopupTradeAdd.aspx`, `PopupTradeBasket.aspx`, `TrxView.aspx` | Nhập/xem giao dịch |
-| Order Submission | `PopupOrderBatch.aspx` | Gửi CO file / MQ real-time |
-| Fundserv I/E | `PopupFundServ.aspx` | Quản lý file import/export |
-| Commission | `CommissionView.aspx`, `PopupCommissionAdd.aspx` | Hoa hồng |
-| Fund Setup | `FundSetup.aspx`, `PopupFundDefAdd.aspx` | Cài đặt thông tin quỹ |
-| Settlement | `SettlementView.aspx` | Thanh toán / settlement |
-| Year-End/Tax | `YearEnd.aspx`, `PanelT619.aspx` | T4RSP, T4RIF, T4FHSA, NR4 |
-| GIC | `PopupGICAdd.aspx`, `PopupGICTrxAdd.aspx` | GIC (Guaranteed Investment Certificate) |
-| RESP | `RESPView.aspx` | RESP (Registered Education Savings Plan) |
-| Onboarding | `OnBoardView.aspx` | New account onboarding |
-| Fee Management | `PanelFeeProcess.aspx`, `PanelFeeRedemptionOrder.aspx` | Quản lý phí |
-| FINTRAC | `FINTRACView.aspx` | KYC/AML compliance |
-| PDF/Reporting | `PdfView.aspx` | PDF generation endpoint |
-| Confirmation | `TrxConfirmationView.aspx` | Trade confirmations |
-
----
-
-## 6. Các loại file Fundserv trao đổi
-
-### 6.1 File Dealer GỬI ĐI (Export – qua VieFUNDIE service)
-
-| Code | Loại | Được sinh bởi | Mô tả |
-|---|---|---|---|
-| **CO** | Confirmation Order | `COrder.OrderFileGenerate()` | Lệnh giao dịch (Buy/Sell/Switch/Transfer) |
-| **NFU** | Non-Financial Update | `CXM.FileGenerate()` | Cập nhật thông tin phi tài chính (địa chỉ, beneficiary) |
-| **GIC** | GIC Order | `CannexOrder.OrderFileGenerate()` | Lệnh mua/bán GIC |
-
-### 6.2 File Dealer NHẬN VỀ (Import – qua VieFUNDIE service)
-
-| Code | Loại | Xử lý bởi | Mô tả |
-|---|---|---|---|
-| **TS** | Transaction Reconciliation | `FFImport.ProcessAllX()` → `Imported/TRX/` | Xác nhận giao dịch |
-| **HS** | Historical Statement | `FFImport.ProcessAllX()` → `Imported/TRX/` | Báo cáo giao dịch historical |
-| **NS** | New Account Setup | `FFImport.ProcessAllX()` | Xác nhận tài khoản mới |
-| **PS** | Position Statement | `FFImport.ProcessAllX()` | Báo cáo vị thế (holdings) |
-| **FS** | Settlement Instruction | `FFImport.ProcessAllX()` | Chỉ dẫn thanh toán |
-| **GS** | Settlement Report | `FFImport.ProcessAllX()` | Báo cáo thanh toán (N$M) |
-| **FD** | Fund Definition | `FFImport.ProcessAllX()` → `Imported/FUND/` | Thông tin quỹ đầu tư |
-| **MD** | Fund Definition Update | `FFImport.ProcessAllX()` → `Imported/FUND/` | Cập nhật thông tin quỹ |
-| **DR** | Dividend Reinvestment | `FFImport.ProcessAllX()` → `Imported/TRX/` | Tái đầu tư cổ tức |
-| **COM** | Commission | `FFImport.ProcessAllX()` → `Imported/COM/` | File hoa hồng |
-| **PRICE** | Price/NAV | `FFImport.ProcessAllX()` → `Imported/PRICE/` | Giá NAV hàng ngày |
-
----
-
-## 7. Mối quan hệ giữa các components
+## 1. Ranh giới runtime
 
 ```mermaid
-graph LR
-    A[User Browser] --> B[WebApp IIS]
-    B --> C[SQL Server Database]
-    B --> D[UBClass.dll]
-    B --> E[UBFFImport.dll]
-    B --> F[UBConnection.dll]
-    
-    G[VieFUNDIE Service] --> E
-    G --> F
-    G --> C
-    G --> H[File System IN/OUT]
-    
-    H --> I[Fundserv Network IBM MQ]
-    
-    J[VieFUNDMQLib] --> I
-    B --> J
+flowchart LR
+    UI[WebApp] --> DB[(Database)]
+    DB -->|batch| IE[VieFUNDIE]
+    IE -->|TFS / NFU| OUT[Filesystem OUT]
+    OUT --> EXT[External batch gateway]
+    DB -->|real-time order| MQS[VieFUNDMQ]
+    MQS -->|request MQMessage| MQ[IBM MQ]
+    MQ -->|response MQMessage| MQS
+    MQS -->|SaveMSGResponse / ImportXMLResp| DB
+    DROP[External drop] --> IN[Filesystem IN]
+    IN --> IE
+    IE --> IMP[FFImport]
+    IMP --> DB
 ```
 
-### Shared code qua DLL
+- **Verified:** `VieFUNDIE` là batch filesystem service: sinh TFS/NFU rồi quét inbound folder.
+- **Verified:** `VieFUNDMQ` là service độc lập: lấy `OrderMSG` từ DB và gửi request trực tiếp vào IBM MQ; chiều nhận đọc response queue, gọi `SaveMSGResponse`/`COrder.ImportXMLResp` rồi đi vào DB/SP boundary. Nó không đọc file OUT và MQ response không qua `FFImport`/file archive.
+- **External boundary:** gateway pickup/drop nằm ngoài repository. Repository không chứa FTP/SFTP client implementation cho hop Fundserv batch này; không gán protocol, lịch, ACK hay credentials khi chưa có deployment evidence.
+- Source đã kiểm tra không cho thấy NFU-over-MQ; luồng NFU được xác nhận ở đây là batch filesystem.
 
-- **UBFFImport.dll** chứa toàn bộ logic import/export file Fundserv. Được dùng bởi CẢ WebApp và VieFUNDIE service.
-- **UBConnection.dll** chứa database access layer. Hỗ trợ **multi-tenant** (nhiều DBID/DSID = nhiều dealership trên cùng 1 instance).
-- VieFUNDIE csproj tham chiếu DLL từ `WebApp/bin/`, nghĩa là **khi build WebApp xong, copy DLL sang** cho service dùng.
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:745-797`
+>
+> Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:997-1193`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:20-34`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:37-147`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:50-84`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:46-75`
 
----
+## 2. Entry point và trách nhiệm
 
-## 8. Lưu ý quan trọng cho development
+| Thành phần | Trách nhiệm thấy trong source |
+|---|---|
+| `WebApp/Main/PopupOrderBatch.aspx.cs` | Truyền order mode (`0` batch, `1` real-time) và đưa NFU qua business/DB boundary. |
+| `Services/VieFUNDIE` | Timer batch, DB-backed settings, TFS/NFU/Cannex generation và inbound scan. |
+| `DLLs/UBFFImport/COrder.cs` | Tạo TFS `OrdSet`; parse physical order response như `DR`. |
+| `DLLs/UBFFImport/CXM.cs` | Tạo NFU `MessageSet`; parse NFU response như `XR`. |
+| `DLLs/UBFFImport/FFImport.cs` | File discovery, dispatch và move/archive/error/skipped. |
+| `Services/VieFUNDMQ` | Kết nối IBM MQ, gửi order message real-time và xử lý queue response riêng. |
+| `DLLs/UBConnection` | Registry DB selection, connection và wrapper gọi settings/SP. |
 
-### 8.1 Multi-tenant
-- Hệ thống hỗ trợ nhiều dealership (`DSID`) trên cùng 1 database (`DBID`).
-- VieFUNDIE service round-robin qua các DBID và lặp qua tất cả DSID.
+Call-site UI chỉ chứng minh mode/request đi vào business layer; row/status mutation cuối cùng vẫn là **DB/SP-dependent**.
 
-### 8.2 Bilingual (EN/FR)
-- Mỗi page `.aspx` có bản `_FR.aspx` riêng.
-- Code-behind `.aspx.cs` **dùng chung** cho cả 2 ngôn ngữ.
-- Biến `Lg` = 0 (English), 1 (French).
+> Source evidence: `WebApp/Main/PopupOrderBatch.aspx.cs:320-377`
+>
+> Source evidence: `WebApp/Main/PopupOrderBatch.aspx.cs:864-903`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:20-166`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:36-150`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:721-1499`
 
-### 8.3 Build và Deploy
-- Build WebApp → output ra `WebApp/bin/`.
-- Build VieFUNDIE → output ra `Services/VieFUNDIE/` (debug) hoặc `Services/` (release).
-- Service cài đặt: `InstallUtil.exe VieFundIE.exe`.
+## 3. Ownership cấu hình
 
-### 8.4 Fundserv Standards Version
-- Hiện tại: **V34** (theo `m_Version = "34.24.04.15"`).
-- Cần nâng cấp lên **V36** (effective June 15, 2026) – xem `FundserV36.md`.
+| Nguồn | Ownership |
+|---|---|
+| Registry | Chọn `DBID`/connection string. Không phải nguồn Fundserv path, encoding hay business schedule. |
+| DB qua `UBFSRuleList('Service')` | `FILE_PATH*`, upload/GIC path, `FILE_ENCODING`, `NO_RUNTIME`, `NO_WRUNDAY`, `NO_MRUNDAY`, `TEST_RUN` và service settings liên quan. |
+| `Services/VieFUNDIE/App.config` | Chủ yếu `QUERYINTERVAL` cho timer (`60000` ms trong file), cùng `DEBUGMODE`. |
+
+`QUERYINTERVAL` là polling interval, không phải blackout schedule. Paths, encoding và schedule thực tế phải đọc từ DB/deployment; default trong code không phải production fact. `FILE_ENCODING` được truyền cho inbound scanner, không điều khiển TFS/NFU outbound writers.
+
+Wrapper `GetVieFundIESettings` nhận tham số `DSID`, nhưng implementation thấy trong repository chỉ bind `TopicStr` khi gọi `UBFSRuleList`. Vì vậy không khẳng định settings được DB lọc theo DSID nếu chưa kiểm tra SP đang deploy.
+
+> Source evidence: `Services/VieFUNDIE/App.config:3-8`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:243-271`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:299-325`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:352-610`
+>
+> Source evidence: `DLLs/UBConnection/CDatabase.cs:1906-1923`
+>
+> Source evidence: `DLLs/UBConnection/CRegistry.cs:24-43`
+>
+> Source evidence: `DLLs/UBConnection/CRegistry.cs:69-125`
+>
+> Source evidence: `DLLs/UBConnection/CRegistry.cs:221-250`
+
+## 4. Outbound contracts
+
+| Luồng | C# kiểm soát | DB/SP-dependent |
+|---|---|---|
+| TFS batch | UTF-8 declaration/writer, root `OrdSet` namespace `tfs`, version normalization và file write | `UBOrderCreateFile` trả filename, `OrderMSG`, version, file ID và flags. |
+| NFU batch | UTF-8 declaration/writer, root `MessageSet` namespace `nfu`, version normalization và file write | `UBNFUCreateFile` trả filename, `MSG`, version và file ID. |
+| TFS real-time | Tạo envelope/MQ message và gửi queue trực tiếp | `UBOrderGetMSG` cung cấp body; status cuối sau SP không suy diễn từ tên call. |
+
+Output XML version luôn `>=35`. Với input `<=35`, output là 35 trước **2026-06-13 00:00:00** và 36 từ thời điểm đó theo local time của host; input `>35` giữ nguyên. Cutover này chỉ chứng minh version attribute của envelope, không chứng minh mọi thay đổi parser/business V36 đã deploy.
+
+TFS có call `UBOrderFileUpdateStatus` sau write; final mutation của SP vẫn chưa được chứng minh. Trong `CXM.FileGenerate`/`UBNFUCreateFile` call path đã đọc không có post-write status SP riêng, nên không gán hành vi TFS đó cho NFU.
+
+> Source evidence: `DLLs/UBFFImport/COrder.cs:20-166`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:36-150`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:37-139`
+
+## 5. Inbound, physical code và archive
+
+`FFImport` lấy file-code metadata từ first-timer result hoặc `UBFSFileCodeList`, dùng generic pattern `FileCode*`/`FileCodeTest*` và các special patterns cho từng integration. Dispatch kết hợp DB metadata với C# switch. Archive cũng tùy integration: subdirectory, layout theo tháng/ngày, error/skipped và collision handling không có một invariant chung.
+
+Physical code `DR` là **order response** và được route vào `COrder.ImportXML`. Distribution trong TS/HS là luồng khác, đi qua CAT/content như `DISTRIBCOF`, `CDistribCof`, `CDistribFund`; không diễn giải `DR` thành distribution.
+
+Handler response gọi SP và đọc status trả về. Chỉ call-site không đủ để kết luận order được confirm/reject thế nào hoặc transaction, holding, NAV hay status nào đã bị thay đổi; các final DB mutations là **DB/SP-dependent**.
+
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:681-704`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:721-760`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:904-1499`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1562-1707`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1712-2005`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:2435-2472`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:713-824`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:575-644`
+>
+> Source evidence: `DLLs/UBFFImport/CAT.cs:1141-1175`
+>
+> Source evidence: `DLLs/UBExport/TS_Export.cs:151-210`
+>
+> Source evidence: `DLLs/UBExport/TS_Export.cs:562-625`
+
+## 6. Cannex GIC và giới hạn deployment
+
+Cannex GIC là integration riêng dùng chung timer/filesystem engine `VieFUNDIE`. Nó có GIC path, generator, inbound patterns/import và archive `CANNEX` riêng; source không chứng minh Cannex đi qua Fundserv hay cùng gateway TFS/NFU.
+
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:763-782`
+>
+> Source evidence: `DLLs/UBFFImport/CannexOrder.cs:536-618`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1123-1328`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1641-1660`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1811-1831`
+
+SQL snapshot, requirement và source snapshot không tự chứng minh production SP/binary parity. Khi thiếu đúng SP version hoặc deployment evidence, giữ nhãn **Historical**, **DB/SP-dependent** hoặc **External boundary** thay vì suy diễn hành vi cuối.

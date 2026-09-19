@@ -1,232 +1,351 @@
 # Order end-to-end — từ nhập lệnh đến confirmed
 
-> Phạm vi: order mutual fund đi qua pipeline VieFUND/FundServ. ETF/stock có nhánh FIX riêng và không được coi là đi qua pipeline FundServ dưới đây. Nội dung được đối chiếu trực tiếp với WebForms, `UBClasses`, `UBFFImport`, stored procedure và bảng trong SQL snapshot; không suy diễn từ tên file.
+> Phạm vi chính: mutual-fund electronic order đi qua VieFUND/FundServ normal path. Network `2`, network `4`/BBS/FIX, omnibus, manual và internal-cash paths được nêu tại điểm rẽ nhưng không bị ép vào cùng một lifecycle.
 
 ## 1. Kết luận nhanh
 
-Một order thông thường đi qua năm chặng:
+Một normal FundServ order thường đi qua các chặng:
 
-1. Người dùng nhập Buy/Sell/Switch/Transfer/ICT tại `PopupTradeAdd.aspx`.
-2. `CTrx` gọi SP nghiệp vụ để kiểm tra rule và ghi order/transaction ở trạng thái chờ gửi.
-3. `IsOrderOK4FS` chặn các order chưa đủ approval, document hoặc settled cash; order hợp lệ được đưa vào queue.
-4. Batch worker hoặc realtime worker tạo XML, gửi ra ngoài và chuyển order sang **Pending to Receive**.
-5. Order response cập nhật Accepted/Rejected; confirmation/settlement response sau đó cập nhật Contracted/Confirmed.
+1. `PopupTradeAdd` gọi `CTrx.Buy/Sell/Switch/Transfer/ICT`.
+2. `CTrx` bind parameter, gọi `UBFundTrx*`, nhận `ID`/`Ret`; core SP ghi order/transaction và side effects.
+3. `PopupOrderBatch` chọn confirm, BBS hoặc normal FundServ queue theo network.
+4. WebForms/CTrx normal single-order enqueue dùng `bForced` default `0`, nên chạy Fund Fact gate, `IsOrderOK4FS`, XML preflight và cash gate trước khi insert queue. Direct/internal `bForced=1` bỏ qua Fund Fact và các code `2..5`, nhưng không bỏ qua code `6`; cash gate vẫn áp dụng cho normal queue type.
+5. Batch worker hoặc realtime IBM MQ worker tạo/gửi XML và chuyển integration status sang Pending to Receive.
+6. `ORDSET` cập nhật Accepted/Rejected/retry; CAT settlement/reconciliation/history cập nhật Contracted/Confirmed/Rejected.
 
 ```mermaid
 flowchart LR
-    UI["PopupTradeAdd.aspx"] --> BLL["CTrx.Buy/Sell/Switch/Transfer/ICT"]
+    UI["PopupTradeAdd"] --> BLL["CTrx.Buy/Sell/Switch/Transfer/ICT"]
     BLL --> SP["UBFundTrx*"]
-    SP --> O["UB_FundTrxOrder: Pending to Send"]
-    O --> G["IsOrderOK4FS + XML preflight"]
-    G --> Q["UB_OrderWaiting2Send"]
-    Q -->|"batch"| F["UBOrderCreateFile + COrder.OrderFileGenerate"]
-    Q -->|"realtime"| M["UBOrderGetMSG + MQ worker"]
-    F --> S["UB_OrderSent; Pending to Receive"]
-    M --> S
-    S --> R["COrder.ImportXML + UBXMLRecOrderRespnProcess"]
-    R --> A["Accepted hoặc Rejected"]
-    A --> C["CAT.ImportXML + UBXMLRecTrxRecordProcess1Record"]
-    C --> D["Contracted hoặc Confirmed"]
+    SP --> O["Order status 1: Pending To Send"]
+    O --> ROUTE{"PopupOrderBatch routing"}
+    ROUTE -->|"network 2"| CONF["Confirm path"]
+    ROUTE -->|"network 4"| BBS["BBS/FIX path"]
+    ROUTE -->|"normal"| CALLER{"Normal caller"}
+    CALLER -->|"WebForms/CTrx; bForced default 0"| G1["Fund Fact gate"]
+    CALLER -->|"direct/internal; bForced=1"| FG["Bypass Fund Fact + FS codes 2..5; code 6 still blocks"]
+    G1 --> G2["IsOrderOK4FS"]
+    G2 --> XML["XML preflight"]
+    FG --> XML
+    XML --> CASH["IsOrderOK4Cash (normal queue type)"]
+    CASH --> Q["UB_OrderWaiting2Send"]
+    Q -->|"batch"| FILE["CO file"]
+    Q -->|"realtime"| MQ["IBM MQ worker"]
+    FILE --> SENT["Order status 2 + UB_OrderSent"]
+    MQ --> SENT
+    SENT --> RESP["ORDSET / ERRORSET"]
+    RESP --> A["Accepted / Rejected / Retry"]
+    A --> CAT["SETTLREC / TRXNREC"]
+    CAT --> DONE["Contracted / Confirmed / Rejected"]
 ```
 
-## 2. Nguồn bằng chứng và ranh giới
+## 2. Baseline bằng chứng và ranh giới
 
-| Tầng | Nguồn đã đối chiếu | Vai trò |
+| Tầng | Source được audit | Xác minh được |
 |---|---|---|
-| UI | `WebApp/Main/PopupTradeAdd.aspx.cs` | Thu input, gọi BLL, diễn giải `errorCode`. |
-| BLL | `UBClasses/Trx.cs` | Đóng gói tham số, gọi SP, nhận `ID` và `Ret`; đưa pending order vào queue. |
-| Tạo/gửi/nhận XML | `UBFFImport/COrder.cs`, `VieFUNDIE/VieFUNDIE.cs` | Tạo CO file, lưu raw response, parse `ORDSET`/`ERRORSET`. |
-| Confirmation | `UBFFImport/CAT.cs` | Parse `SETTLINSTR`, `TRXNRECON`, `TRXNHISTORY` và stage record. |
-| Rule + persistence | `ScriptDB/000_3_CreateUDF.sql`, `ScriptDB/000_4_CreateSP.sql` | Validation, state transition, XML, queue, response và confirmation. |
-| Bảng lõi | `UB_FundTrxOrder`, `UB_FundTrx`, `UB_FundTrxOrderTrx`, `UB_FundAccountPosition`, `UB_OrderWaiting2Send`, `UB_OrderMSG`, `UB_OrderSent`, `UB_OrderMSGError` | Trạng thái nghiệp vụ và integration. |
+| UI | `WebApp/Main/PopupTradeAdd.aspx.cs`, `PopupOrderBatch.aspx.cs` | Input, validation, BLL calls, network routing, cách diễn giải `Ret`. |
+| BLL | `DLLs/UBClasses/Trx.cs` | Parameter forwarding, SP call, `ID`/`Ret`, pending/action wrappers. |
+| Batch | `DLLs/UBFFImport/COrder.cs`, `Services/VieFUNDIE/VieFUNDIE.cs` | CO-file generation, raw response/import parser. |
+| Realtime | `Services/VieFUNDMQ/Order.cs`, `Services/VieFUNDMQ/VieFUNDMQ.cs` | `UBOrderGetMSG`, IBM MQ put, `UBOrderSetMsgStatus` call path. |
+| Confirmation | `DLLs/UBFFImport/CAT.cs` | Parse/stage CAT records và gọi processing SP. |
+| SQL | `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_3_CreateUDF.sql`, `000_4_CreateSP.sql` | SP/UDF definitions, query/insert/update behavior trong snapshot. |
 
-`VieFUNDMQLib` không có source transport trong workspace, chỉ có artifact build/compiled. Vì vậy tài liệu xác minh được contract DB trước/sau MQ (`UBOrderGetMSG`, `UBOrderSetMsgStatus`), nhưng không khẳng định cơ chế kết nối, retry hay acknowledgement bên trong worker.
+Ranh giới audit:
 
-## 3. Chặng 1 — nhập và tạo order
+- Repository có duplicate C#/SQL tree và không có deployment manifest; không thể khẳng định production đang dùng đúng snapshot này.
+- Không tìm thấy base `CREATE TABLE` hoặc lookup seed cho các bảng lõi. Table/column bên dưới là **usage map**, không phải schema/constraint map.
+- Realtime source tồn tại, nhưng service installation, queue configuration, acknowledgement và retry policy production không được chứng minh từ repository.
+- T+1/T+2 và một số business timing không được source này cưỡng chế.
 
-### 3.1. Điểm vào theo loại giao dịch
+## 3. Chặng 1 — tạo order
 
-| Giao dịch | UI → BLL | Stored procedure chính | Giá trị khởi tạo đáng chú ý |
+### 3.1. Entry point và SP
+
+| Giao dịch | UI → BLL | SP | Branch/value quan sát được |
 |---|---|---|---|
-| Buy | `OnBuy` → `CTrx.Buy` | `UBFundTrxBuy` | `Type='5'`; `iType=22` cho regular buy, `40` cho commission rebate; transaction `iStatus=3`; order `iOrderStatus=1`. |
-| Sell / fee redemption | `OnSell` → `CTrx.Sell` | `UBFundTrxSell` | `Type='6'`, `iType=45` cho sell; `Type='4'`, `iType=20` cho fee redemption; trạng thái ban đầu 3/1. |
-| Switch | `OnSwitch` → `CTrx.Switch` | `UBFundTrxSwitch` | Tạo các phía liên quan; có `iType=27` switch-in và `44` rollover trong nhánh đã xác minh; trạng thái ban đầu 3/1. |
-| Transfer | `OnTransfer` → `CTrx.Transfer` | `UBFundTrxTransfer` | Internal/external transfer đi theo các nhánh `iType=42`, `39`, `65`; không gán một nhãn duy nhất cho mọi nhánh. |
-| ICT | `OnICT` → `CTrx.ICT` | `UBFundTrxICT` | Nhánh chính dùng `Type='8'`, `iType=75`; trạng thái ban đầu 3/1. |
+| Buy | `OnBuy` → `CTrx.Buy` | `UBFundTrxBuy` | `Type='5'`; regular buy thường dùng `iType=22`, rebate branch dùng `40`; core electronic branch tạo transaction/order ở `3/1`. |
+| Sell | `OnSell` → `CTrx.Sell` | `UBFundTrxSell` | `Type='6'`, `iType=45`; main `Type='4'` path collapse về `iType=20`. Canonical `UBFundTrxSellShort` phân biệt blank `ProdEventInd` → `iType=20` (`fee`) và `ProdEventInd='O'` → `iType=90` (`fee redemption`). |
+| Switch | `OnSwitch` → `CTrx.Switch` | `UBFundTrxSwitch` | Tạo các phía liên quan; thấy `iType=27`, `44` trong các branch cụ thể. |
+| Transfer | `OnTransfer` → `CTrx.Transfer` | `UBFundTrxTransfer` | Internal/external branches có `iType=42`, `39`, `65`; không phải exhaustive enum. |
+| ICT | `OnICT` → `CTrx.ICT` | `UBFundTrxICT` | Branch chính thấy `Type='8'`, `iType=75`. |
+| ETF qua trade tabs | `OnBuy/OnSell` → `CTrx.Buy/Sell` | `UBFundTrxBuy/Sell` | UI truyền ETF fields khi `iNetwork=4`; routing BBS/FIX diễn ra sau create. |
+| Standalone stock | `PanelStockOrder` → `CTrx.StockOrderAdd` | `UBStockOrderAdd` | Entry point riêng, không đại diện mọi ETF order. |
 
-Các SP lõi kiểm tra rule trước khi ghi. Nếu thành công, chúng gọi các routine như `UBFundTrxOrderAdd`, `UBTrxAdd`, tạo liên kết `UB_FundTrxOrderTrx` và cập nhật/archive position liên quan. Không nên chỉ insert trực tiếp vào `UB_FundTrxOrder`: việc đó bỏ qua validation, transaction record, audit/archive và các side effect trust/compliance.
+Các numeric/type values chỉ là branch usage trong canonical snapshot; authoritative label đầy đủ phụ thuộc `UB_Def_TrxType` seed không có trong repository và behavior runtime còn phải đối chiếu SP đang deploy. Đặc biệt, không dùng riêng `iType=20` như label toàn cục cho fee redemption vì discriminator `20/90` khác nhau giữa main Sell và SellShort.
 
-### 3.2. Contract trả về UI
+Core SP gọi các routine như `UBFundTrxOrderAdd`, `UBTrxAdd`, ghi `UB_FundTrxOrderTrx` và cập nhật/archive position, trust/compliance state tùy branch. Insert trực tiếp một order header sẽ bỏ qua validation và side effects.
 
-`CTrx.*` đọc hai output quan trọng:
+### 3.2. `ID`/`Ret` contract và UI mapping
 
-- `ID`: khóa order vừa tạo/cập nhật;
-- `Ret`: mã kết quả nghiệp vụ.
+`CTrx.*` đọc `ID` và `Ret`, nhưng UI không có một ngưỡng mapping thống nhất:
 
-Quy ước ở UI là `Ret >= 10` được đổi thành message bằng `CMSG.GetTrxErrorMSG(Lg, Ret - 10)`. Các mã `0`, `1`, `2`, `9` được xử lý riêng. Chi tiết và các bất thường mapping nằm trong [Order Code Dictionary](code-dictionary.md).
+| Handler | Điều kiện gọi `GetTrxErrorMSG(Ret - 10)` |
+|---|---|
+| Sell | `Ret >= 10` |
+| Buy, Switch, Transfer, ICT | `Ret > 10` |
 
-## 4. Chặng 2 — từ pending order vào hàng đợi
+Vì vậy `Ret=10` không có behavior chung. Các mã ngoài bounds message array cũng có defect riêng; xem [Order Code Dictionary](code-dictionary.md).
 
-`CTrx.OrderPendingMove2Waiting` gọi `UBOrderWaiting2SendAdd`. Routine này chuyển tiếp vào `UBOrderWaiting2SendAddInternal`.
+### 3.3. Parameter bị drop
 
-Trước khi enqueue, SQL thực hiện hai gate chính:
+`AOTDilution` được UI truyền vào signatures của Buy/Sell/Switch nhưng các implementation không bind nó vào SP. Transfer handler tính value nhưng `CTrx.Transfer` không nhận parameter tương ứng. Không được coi dilution là đã persist chỉ vì xuất hiện ở UI/signature.
 
-1. `IsOrderOK4FS(orderID)` kiểm tra approval, trạng thái plan/document và settled cash.
-2. `UBOrderCreateMSGXML(..., iOptions=2)` dựng thử message để kiểm tra dữ liệu/XML; đây là preflight, chưa tạo message gửi thật. Schema validation chỉ chạy nếu feature flag tương ứng cũng bật.
+## 4. Chặng 2 — routing và enqueue
 
-Mã gate:
+### 4.1. Route được chọn trước normal queue
 
-| Mã | Ý nghĩa trong source |
+`PopupOrderBatch` chọn:
+
+- network `2` → `CTrx.OrderPending2Confirm` → `UBOrderSetConfirmTaggedItems`;
+- network `4` → `CTrx.OrderPendingMove2BBS` → `UBOrderWaiting2BBSOrder`;
+- còn lại → `CTrx.OrderPendingMove2Waiting` → `UBOrderWaiting2SendAdd`.
+
+Normal bulk-selection SQL còn lọc `iNetwork=0`. Vì vậy không mô tả network-4/BBS như một nhánh tự động phổ quát bên trong normal wrapper.
+
+### 4.2. Gate của normal single-order path
+
+Call chain dưới đây là WebForms/CTrx default path. `CTrx.OrderPendingMove2Waiting` không bind/expose `bForced`, nên `UBOrderWaiting2SendAddInternal` nhận default `0`:
+
+```text
+CTrx.OrderPendingMove2Waiting       // không bind bForced
+  → UBOrderWaiting2SendAdd           // @bForced default 0
+  → UBOrderWaiting2SendAddInternal
+      → IsFundFactOKOrder
+      → IsOrderOK4FS
+      → UBOrderCreateMSGXML(iOptions=2)   // preflight
+      → UBOrderWaiting2SendAddOne
+          → IsOrderOK4Cash
+          → insert queue
+```
+
+`IsOrderOK4FS` trả các code quan sát được:
+
+| Code | Ý nghĩa trong UDF/comment snapshot |
 |---:|---|
-| 1 | Hợp lệ để gửi. |
-| 2 | Cần transaction approval cấp 1. |
-| 3 | Cần plan approval cấp 1. |
-| 4 | Cần plan approval cấp 2. |
-| 5 | Thiếu document quá 25 ngày. |
-| 6 | Không đủ settled cash. |
+| `1` | Hợp lệ để gửi. |
+| `2` | Cần transaction approval cấp 1. |
+| `3` | Cần plan approval cấp 1. |
+| `4` | Cần plan approval cấp 2. |
+| `5` | Thiếu document quá 25 ngày. |
+| `6` | Không đủ settled cash. |
 
-Order hợp lệ được ghi vào queue. `iMode=0` là batch, `iMode=1` là realtime. Routing không chỉ phụ thuộc mode:
+Nuance quan trọng:
 
-- network `4` và dealer khác `7908` có thể đi `SK_OrderWaiting2Send`;
-- dealer `7908` đi queue omnibus và bị ép không realtime;
-- management code `VEX` bị ép batch;
-- `UBOrderWaiting2SendAddOne` còn phân loại normal/omnibus/SK-BBS bằng `iType` queue.
+- trên WebForms/CTrx default path, `bForced=0`, nên `IsFundFactOKOrder` là gate thực sự và condition `(@bForced=0 AND code>1) OR code=6` chặn `IsOrderOK4FS` code `2..6`;
+- direct/internal SP call với `bForced=1` bỏ qua cả `IsFundFactOKOrder` và `IsOrderOK4FS` code `2..5`, nhưng code `6` vẫn chặn;
+- code `0` không bị condition này chặn dù success contract thông thường là `1`;
+- `IsOrderOK4Cash` là gate riêng và vẫn áp dụng cho normal queue type; forced mode không bỏ qua gate này;
+- bulk selection lọc `IsOrderOK4FS(...)=1`, nên default single, forced internal và bulk path không tương đương.
 
-Đây là routing theo code hiện tại, không phải bộ policy đầy đủ cho mọi deployment.
+### 4.3. Queue/routing nuance và defect
+
+- `iMode=0` là batch, `iMode=1` là realtime trong normal queue contract.
+- `VEX` bị ép batch trong branch đã trace.
+- Omnibus/SK routing còn phụ thuộc dealer/config/helper; dealer `7908` có omnibus/batch branch.
+- `UBOrderWaiting2SendAddOne` có special branch theo `iType`; không suy ra global policy chỉ từ một literal.
+- `CTrx.OrderPendingMove2Waiting` truyền `bNewSourceID`, nhưng `UBOrderWaiting2SendAdd` gọi internal bằng literal `0`; flag bị bỏ qua trên path này.
+- Queue insert nằm trong `TRY/CATCH` không propagate; internal caller vẫn có thể tăng order count. Count trả về không đảm bảo row đã insert.
+- Validation/selection có `WITH (NOLOCK)`, nên result không phải consistency guarantee.
 
 ## 5. Chặng 3 — tạo message và đánh dấu đã gửi
 
-### 5.1. Batch
+### 5.1. Batch/CO file
 
-`VieFUNDIE` gọi `COrder.OrderFileGenerate`:
+`Services/VieFUNDIE/VieFUNDIE.cs` gọi `COrder.OrderFileGenerate`:
 
-1. `UBOrderCreateFile` chọn queue `iStatus=0`, `iMode=0`, claim row và gom theo dealer/intermediary.
-2. `UBOrderCreateMSGXML(..., iOptions=0)` tạo XML và row `UB_OrderMSG`.
-3. C# ghi nội dung ra file.
-4. Nếu ghi file thành công, `UBOrderFileUpdateStatus(..., iStatus=1)`:
-   - chuyển `UB_OrderMSG.iStatus` sang `2`;
-   - chuyển order và transaction đang pending sang `iOrderStatus=2`;
-   - tạo `UB_OrderSent.iStatus=0` để chờ response;
-   - dọn queue/message cũ theo contract của SP.
+1. `UBOrderCreateFile` chọn/claim queue batch (`iStatus=0`, `iMode=0`) và group theo integration fields.
+2. `UBOrderCreateMSGXML(..., iOptions=0)` tạo XML và `UB_OrderMSG`.
+3. C# ghi file ra filesystem.
+4. `UBOrderFileUpdateStatus` chuyển message sang sent, cập nhật order/trx integration status, tạo `UB_OrderSent`, dọn queue/message theo SP contract.
 
-Tên file và grouping có hard-code integration cho DSID/dealer/intermediary; xem [mục DSID và routing](code-dictionary.md#8-hard-code-dsid-dealer-và-routing).
+Caveat:
 
-### 5.2. Realtime
+- `COrder.OrderFileGenerate` khởi tạo result `true`; một số DB/open/execute/status-update failure không chuyển thành `false`, và result của status update bị bỏ qua.
+- `UBOrderFileUpdateStatus.@iStatus` được truyền nhưng snapshot không dùng parameter để quyết định transition.
 
-`UBOrderGetMSG(iMode=1)` claim queue realtime, tạo `UB_OrderMSG` và trả payload cho worker. Sau khi transport xử lý, contract dự kiến gọi `UBOrderSetMsgStatus`:
+### 5.2. Realtime/IBM MQ
 
-- `iStatus=2`: đánh dấu message sent, order/trx thành Pending to Receive và upsert `UB_OrderSent`;
-- khác `2`: xóa message tạo dở;
-- cả hai nhánh đều dọn row queue.
+Source runtime có trong `Services/VieFUNDMQ`:
 
-Do thiếu source `VieFUNDMQLib`, việc worker nào gọi contract này và retry thế nào cần xác minh ở deployment/runtime.
+```text
+COrder.GetOrderSet
+  → UBOrderGetMSG(iMode=1)
+VieFUNDMQ.SendMsg
+  → put XML lên IBM MQ
+COrder.UpdateOrderSet
+  → UBOrderSetMsgStatus
+```
+
+`UBOrderGetMSG` phân tách test/prod qua `UB_CustomerTest`, chọn theo dealer và claim queue `0→1`. Sau transport:
+
+- status `2`: message sent, order/transaction integration status sang `2`, upsert `UB_OrderSent`;
+- status khác `2`: xóa message tạo dở;
+- cả hai nhánh dọn queue; SP không tự re-enqueue.
+
+`COrder.UpdateOrderSet` hiện return `(errorCode > 0)`, tức `false` khi DB call thành công và `true` khi lỗi; caller đã trace bỏ qua result. Đây là contract đảo ngược, chủ yếu ảnh hưởng monitoring/control nếu caller khác dùng return value.
+
+### 5.3. Status column và atomicity
+
+Send-status SP:
+
+- đổi `UB_FundTrxOrder.iOrderStatus` sang `2`;
+- đổi `UB_FundTrx.iOrderStatus` sang `2` khi business `UB_FundTrx.iStatus=3`;
+- không đổi business `iStatus=3` thành `2`;
+- cập nhật `dtTrade` qua `GetTradeDate()` trong branch đã trace;
+- update nhiều table nhưng không có outer transaction end-to-end.
+
+Không gọi operation này là atomic. Nếu fail giữa chừng, phải kiểm tra order, transaction, message, sent marker và queue riêng.
 
 ## 6. Chặng 4 — order response
 
-`COrder.ImportXML` lưu raw response rồi `ImportXMLResp` phân nhánh:
+### 6.1. Parser paths
 
-- `ORDSET` → parse từng `ORDRSPN` → gọi `UBXMLRecOrderRespnProcess`;
-- `ERRORSET` → parse network error → gọi `UBXMLRecOrderRespnProcessError` trong nhánh được code xử lý.
+`COrder.ImportXML` lưu raw response rồi phân nhánh:
 
-Các field chính được parser lấy gồm `ACTNCODE`, `SRCID`, `FUNDACCTID`, `ORDID`, `TRADEDATE`, `SETTLDATE`, `RTNCODE`, `RSPNSRC`, `DOCREQDFLG`, dealer code, tối đa các error/warning slot.
+- `ORDSET` → parse `ORDRSPN` → `UBXMLRecOrderRespnProcess`;
+- `ERRORSET` → `ProcessXMLErrorSet` → dự kiến gọi `UBXMLRecOrderRespnProcessError`.
 
-### 6.1. Quyết định status của response chuẩn
+Parser đọc action/source/fund-account/order/trade/settlement/return/response/document/dealer fields và các reject/warning slots.
 
-| Điều kiện SQL | Kết quả order | Kết quả transaction | Side effect |
+### 6.2. Standard `ORDSET` status logic
+
+| Điều kiện SQL | Order | Transaction | Side effect chính |
 |---|---:|---:|---|
-| Mặc định, không có reject | 4 Accepted | 4 In Progress | Warning được lưu nếu có. |
-| `ErrorCode1` có giá trị và `ReturnCode <> '00'`, hoặc `ReturnCode='99'` | 3 Rejected | 1 Rejected | Lưu lỗi, bỏ row chờ trong `UB_OrderSent`. |
-| Action `CAN`/`CAX` | Theo nhánh response | 2 Cancelled | Bỏ liên kết trust liên quan. |
-| `ReturnCode='98'` và `ErrorCode1='003'` | Trả từ 2 về 1 | Giữ/đưa về trạng thái retry theo code | Xóa `UB_OrderSent` để gửi lại. |
-| `ErrorCode1='012'` | Không cập nhật order | Không cập nhật | Record bị skip ngay trong SP. |
+| Match thành công, không reject | `4` Accepted | `4` In Progress | Lưu warning nếu có. |
+| Error present với return khác `00`, hoặc return `99` | `3` Rejected | `1` Rejected | Lưu error, bỏ sent marker. |
+| Action `CAN`/`CAX` | Theo branch | `2` Cancelled | Bỏ trust link liên quan. |
+| Return `98` + error `003` | `2→1` retry | Intended retry update | Xóa `UB_OrderSent`. SQL có defect `@iTrxStatus` nêu bên dưới. |
+| Error `012` | Không update | Không update | Record bị skip. |
 
-Error/warning được ghi vào `UB_OrderMSGError`: `iType=2` cho error, `iType=1` cho warning. Nội dung hiển thị tra từ `UB_Def_FSRVError` qua UDF `FundServErrorStr`; seed data của bảng này không có trong workspace, nên không thể lập danh sách mô tả chính thức cho mọi mã FundServ chỉ từ repository.
+`UB_OrderMSGError.iType=2` là error, `1` là warning. Label tra qua `UB_Def_FSRVError`; repository không có seed nên không thể xuất official description cho mọi code.
 
-### 6.2. Matching response về order
+Accepted path còn có side effects trong các branch cụ thể: cập nhật first-purchase fund-account ID, commission rebate, conversion processing; CHG có thể dọn error/warning cũ. Replay response không chỉ là đổi status.
 
-SP ưu tiên tìm `UB_OrderSent` theo `SourceID` và `MgmtCode`, sau đó mới dùng fallback matching. Source còn chứa:
+### 6.3. Correlation
 
-- cửa sổ tìm trong 15 ngày gần nhất;
-- một cửa sổ ngày cố định năm 2023;
-- dealer code `7907`, `9499`, `7968` trong nhánh tương thích đặc biệt.
+SP ưu tiên `UB_OrderSent` theo `SourceID + MgmtCode`, rồi fallback trong cửa sổ gần đây. Snapshot còn chứa hard-coded date window năm 2023 và dealer `7907`, `9499`, `7968`; date condition này đã hết hiệu lực theo thời gian bình thường và nên được coi là dead-by-date legacy branch, không phải policy hiện hành.
 
-Các literal này là technical debt/routing legacy cần xác minh trước khi thay đổi; không được coi là policy chung.
+### 6.4. `ERRORSET` không đáng tin cậy như standard path
 
-## 7. Chặng 5 — contracted và confirmed
+Các defect trực tiếp trong `COrder.ProcessXMLErrorSet`/wrapper:
 
-Order response Accepted chưa phải là kết thúc giao dịch. `CAT.ImportXML` nhận các message `SETTLINSTR`, `TRXNRECON`, `TRXNHISTORY`, parse `SETTLREC`/`TRXNREC`, sau đó gọi `UBXMLRecTrxRecordProcess` → `UBXMLRecTrxRecordProcess1Record`.
+1. kiểm cùng `ErrorCode` với cả `"98"` và `"003"`, nên retry condition không thể true;
+2. kiểm `ErrorCode == "99"` thay vì `RtnCode == "99"`; sample format cạnh method cũng tách hai field này;
+3. C# bind `OrdID` trong khi SQL parameter là `OrderID`; cần integration test để xác định DB helper xử lý mismatch thế nào;
+4. exception bị nuốt và method có thể vẫn trả `true`.
 
-Routine một-record dispatch theo record type như BUYCON/BUYCOF, SELLCON/SELLCOF, SWITCHCON/SWITCHCOF, DISTRIBCOF, ROC, ITCOF/ETCOF. Hai UDF xác định trạng thái:
+Vì vậy logic chuẩn `00/01/98+003/99` trong SQL không chứng minh network `ERRORSET` luôn tới được đúng SP.
 
-| External order status | `UB_FundTrx.iStatus` qua `FSUBGetTrxStatus` | `UB_FundTrxOrder.iOrderStatus` qua `FSUBGetTrxWOStatus` |
+### 6.5. Slot và false-success
+
+- SQL contract nhận `ErrorCode1..5` và `WarningCode1..5`.
+- `ImportXMLGetReject` dùng `iCount < 5`, nên parser chỉ giữ slot 1–4.
+- `COrder.ImportXML` khởi tạo success `true` và có đường trả `true` khi stream/reader không mở được.
+- Standard response routine và per-transaction updates không có một outer transaction bao toàn bộ status/trust/error side effects; một số lỗi bị catch mà không propagate.
+
+## 7. Chặng 5 — CAT contracted/confirmed
+
+`CAT.ImportXML` nhận `SETTLINSTR`, `TRXNRECON`, `TRXNHISTORY`, stage `SETTLREC`/`TRXNREC`, rồi gọi `UBXMLRecTrxRecordProcess` → `UBXMLRecTrxRecordProcess1Record`.
+
+Dispatcher có các record details BUY/SELL/SWITCH/DISTRIB/ROC/IT/ET variants. Trước mapping, SQL normalize blank khác nhau:
+
+| Record | Blank normalization | Kết quả qua UDF |
+|---|---|---|
+| `SETTLREC` | blank → `A` | transaction/order `5` Contracted |
+| `TRXNREC` | blank → `S` | transaction/order `6` Confirmed |
+
+General mapping:
+
+| External status | `FSUBGetTrxStatus` | `FSUBGetTrxWOStatus` |
 |---|---:|---:|
-| `A` | 5 Contracted | 5 Contracted |
-| `S`, blank/space | 6 Confirmed | 6 Confirmed |
-| `R` | 1 Rejected | 3 Rejected |
+| `A` | `5` Contracted | `5` Contracted |
+| `S` hoặc blank/space tại UDF level | `6` Confirmed | `6` Confirmed |
+| `R` | `1` Rejected | `3` Rejected |
 
-Settlement tiền/cheque/EFT/trust sau confirmation là một miền liên quan nhưng có workflow riêng; xem [Settlement](../settlement/README.md).
+Không suy ra T+1/T+2 hoặc “non-cash skip Contracted” chỉ từ mapping này. NULL cũng không mặc định đồng nghĩa blank ở mọi branch.
+
+`CAT` wrapper dùng return values `3/4/5` theo processing contract riêng; không trộn với order-response import status `0..3`.
 
 ## 8. Change, cancel, reversal và AOT
 
-| Action | Nơi xử lý | Hành vi đã xác minh |
-|---|---|---|
-| `NEW` | Các SP `UBFundTrx*` | Order mới. Khi XML tạo lại một order đã có `OrderID` và status phù hợp, SQL có thể đổi sang `CHG`. |
-| `CHG` | `UBFundTrxChange`, XML builder | Order đã gửi/accepted được đưa lại Pending to Send để gửi thay đổi. |
-| `CAN` | `UBFundTrxCancel(iOptions=0)` | Cancel order; transaction chuyển Cancelled theo nhánh hiện hành. |
-| `CAX` | `UBFundTrxCancel(iOptions=1)` | Biến thể cancel được display như Cancel. |
-| `REV` | `UBFundTrxCancel(iOptions=2)` | Tạo reversal order riêng qua `UBFundTrxOrderREVAdd`. |
-| `AOT` | UI/SP/XML | As-of trade yêu cầu ngày/original order theo rule; vẫn được `IsOrderOK4FS` cho đi qua gate action. |
-
-`DEL` xuất hiện ở lớp thao tác UI/domain nhưng không được xác minh là `ActnCode` gửi FundServ trong pipeline này.
-
-## 9. Bản đồ bảng và trách nhiệm
-
-| Bảng | Trách nhiệm trong flow |
+| Action | Source contract |
 |---|---|
-| `UB_FundTrxOrder` | Order header, action/type/amount/settlement, `iOrderStatus`, IDs FundServ. |
-| `UB_FundTrx` | Transaction hạch toán/nghiệp vụ và `iStatus`; được nối với order qua bảng bridge. |
-| `UB_FundTrxOrderTrx` | Quan hệ order ↔ transaction. |
-| `UB_FundAccountPosition` | Position/account fund được order tác động. |
-| `UB_OrderWaiting2Send` | Queue FundServ thông thường. |
-| `UB_OrderWaiting2Omnibus`, `SK_OrderWaiting2Send` | Queue/routing đặc biệt. |
-| `UB_OrderMSG` | XML message đã dựng và trạng thái message. |
-| `UB_OrderSent` | Correlation của order đã gửi đang chờ response. |
-| `UB_OrderMSGError` | Error/warning từ response. |
-| `UB_Def_TrxOrderStatus`, `UB_Def_FSRVError`, `UB_Def_TrxType` | Bảng định nghĩa dùng cho display/lookup; không hard-code toàn bộ label trong C#. |
+| `NEW` | Default của core add SP; XML builder có thể đổi thành CHG nếu external order ID/status phù hợp. |
+| `CHG` | `UBFundTrxChange` và XML builder cho thay đổi order. |
+| `CAN` | `UBFundTrxCancel(iOptions=0)`; wrapper comment cho Accepted. |
+| `CAX` | `UBFundTrxCancel(iOptions=1)`; wrapper comment cho Accepted hoặc Contracted. |
+| `REV` | `UBFundTrxCancel(iOptions=2)` tạo reversal order qua `UBFundTrxOrderREVAdd`. |
+| `AOT` | UI/SP/XML có date/original-order rules; action được `IsOrderOK4FS` nhận biết. |
+
+`CTrx.AllowableAction` gọi `UBFundTrxOrderCANCAX` chỉ để lấy flags; `CTrx.TrxOrderCANCAX` gọi `UBFundTrxCancel` để thực thi. `DEL` là UI/domain action, chưa được chứng minh là FundServ `ActnCode` trong pipeline này.
+
+## 9. Table usage map, không phải base schema
+
+| Object | Usage quan sát được |
+|---|---|
+| `UB_FundTrxOrder` | Order header, action/type/amount/settlement, external IDs và `iOrderStatus`. |
+| `UB_FundTrx` | Business transaction `iStatus`, integration `iOrderStatus`, và direct `iOrderID` ở một số path. |
+| `UB_FundTrxOrderTrx` | Bridge usage qua `iOrderID`, `iTrxID`; không suy ra FK/cardinality vì thiếu DDL. |
+| `UB_FundAccountPosition` | Position/account-fund bị order tác động. |
+| `UB_OrderWaiting2Send` | Normal FundServ queue. |
+| `UB_OrderWaiting2Omnibus`, `SK_OrderWaiting2Send` | Special routing queues. |
+| `UB_OrderMSG` | XML payload/message status. |
+| `UB_OrderSent` | Correlation marker đang chờ response. |
+| `UB_OrderMSGError` | Response error/warning rows. |
+| `UB_Def_TrxOrderStatus`, `UB_Def_FSRVError`, `UB_Def_TrxType` | Lookup được query; seed/label production không có trong repository. |
+
+Không tìm thấy SQL `VIEW` được docs này dùng; `TrxView.aspx` là WebForms page.
 
 ## 10. Checklist truy lỗi một order
 
-1. Lấy `UB_FundTrxOrder.ID`, `SourceID`, `OrderID`, `ActnCode`, `iOrderStatus`, `iPlanID`, `iPositionID`.
-2. Kiểm tra `UB_FundTrxOrderTrx` và `UB_FundTrx.iStatus` để tránh chỉ nhìn order header.
-3. Nếu status 1: chạy/đối chiếu `IsOrderOK4FS`, kiểm tra queue thường/omnibus/SK và XML preflight error.
-4. Nếu status 2: tìm `UB_OrderMSG`, `UB_OrderSent`; dùng `SourceID` + `MgmtCode` làm correlation chính.
-5. Nếu status 3/4: đọc `ReturnCode`, `ErrorCode*`, `WarningCode*` và `UB_OrderMSGError`.
-6. Nếu đã Accepted nhưng chưa Contracted/Confirmed: kiểm tra file/message CAT và record stage của `UBXMLRecTrxRecordProcess*`.
-7. Luôn kiểm tra DSID, network, dealer, intermediary và mode vì chúng có thể đổi queue/routing.
+1. Xác định deployment/version trước khi so line number: binary C#, SQL SP/UDF và config production có thể không khớp repository snapshot.
+2. Lấy order `ID`, `SourceID`, `OrderID`, `ActnCode`, `iOrderStatus`, `iNetwork`, plan/position và routing fields.
+3. Kiểm tra cả direct `UB_FundTrx.iOrderID` và bridge `UB_FundTrxOrderTrx`; đọc riêng `UB_FundTrx.iStatus`/`iOrderStatus`.
+4. Nếu order status `1`, kiểm tra route network trước. Với normal WebForms/CTrx path (`bForced` default `0`), kiểm tra Fund Fact, `IsOrderOK4FS`, XML preflight và `IsOrderOK4Cash`; với direct/internal `bForced=1`, Fund Fact và code `2..5` được bypass nhưng code `6` cùng cash gate của normal queue type vẫn phải kiểm tra.
+5. Không coi enqueue count là persistence proof; query row queue và trạng thái claim thực tế.
+6. Nếu status `2`, kiểm tra `UB_OrderMSG`, `UB_OrderSent`, raw response và `SourceID + MgmtCode` correlation.
+7. Phân biệt standard `ORDSET` với `ERRORSET`; kiểm tra return/error variables và parser slot loss.
+8. Nếu Accepted nhưng chưa Contracted/Confirmed, kiểm tra CAT message type, staged record, blank normalization và one-record dispatcher.
+9. Kiểm tra partial-update state vì send/response paths không có outer transaction; đừng chỉ đọc một table.
+10. Kiểm tra DSID/dealer/intermediary/mode/config và service installation trước khi kết luận code branch đã chạy.
 
-## 11. Findings phát hiện trong lúc đối chiếu
+## 11. Defect candidates đã xác nhận từ source
 
-Đây là defect candidate có bằng chứng source, chưa được sửa runtime trong lượt viết tài liệu:
+Các item dưới đây chưa được sửa runtime trong lượt audit tài liệu:
 
-1. `COrder.ProcessXMLErrorSet` so cùng biến `ErrorCode` với cả `"98"` và `"003"`; điều kiện retry không thể đúng. SQL dùng đúng cặp `ReturnCode='98'` + `ErrorCode='003'`.
-2. `COrder.ImportXMLGetReject` dùng `iCount < 5`, nên chỉ nhận slot 1–4 dù DataTable/SP có `ErrorCode1..5` và `WarningCode1..5`.
-3. `COrder.ImportXML` và `CAT.ImportXML` khởi tạo kết quả `true` rồi trả `true` khi không mở được stream/reader; caller có thể nhận success dù import chưa chạy.
-4. Hai nhánh retry `98/003` trong SQL dùng `@iTrxStatus` trước khi thấy khởi tạo trong procedure; cần test schema/runtime để xác nhận có ghi `NULL` hoặc bị rollback.
-5. `UBFundTrxSell` trả `Ret=104`, nhưng UI trừ 10 rồi truy cập bảng message chỉ có index 0–85; kết quả hiện rơi về message generic thay vì message fee-redemption dự kiến.
-6. Bounds check của `CMSG.GetTrxErrorMSG` dùng `>` thay vì `>=`; index đúng bằng `Length` có thể vượt mảng.
-7. Ngưỡng mapping ở Sell là `>=10`, trong khi Buy/Switch/Transfer/ICT dùng `>10`; mã 10 sẽ được diễn giải không nhất quán dù chưa thấy SP lõi trả mã này.
+| ID | Bằng chứng | Tác động tiềm năng |
+|---|---|---|
+| `ORD-PARAM-01` | `AOTDilution` có ở UI/signature nhưng không bind SP; Transfer không nhận value | Dilution không được persist như caller kỳ vọng. |
+| `ORD-QUEUE-01` | Wrapper nhận `bNewSourceID` nhưng gọi internal với literal `0` | Flag không có hiệu lực. |
+| `ORD-QUEUE-02` | Queue insert catch không propagate; caller vẫn tăng count | False-success enqueue/report count. |
+| `ORD-QUEUE-03` | Single branch cho code `0`, forced bypass `2..5` nhưng không `6`; bulk yêu cầu `=1` | Kết quả khác nhau giữa single/bulk. |
+| `ORD-SEND-01` | `UBOrderFileUpdateStatus.@iStatus` không được dùng | Caller không điều khiển transition như signature gợi ý. |
+| `ORD-SEND-02` | Send updates nhiều table không có outer transaction và reset `dtTrade` | Partial state/date side effect khi lỗi. |
+| `ORD-BATCH-01` | `OrderFileGenerate` khởi tạo `true`, bỏ qua một số failure/status result | Monitoring có thể ghi success giả. |
+| `ORD-MQ-01` | `UpdateOrderSet` trả `(errorCode > 0)` | Boolean đảo ngược; caller khác có thể hiểu sai. |
+| `ORD-RESP-01` | C# so `ErrorCode` đồng thời `98` và `003` | ERRORSET busy/retry không chạy. |
+| `ORD-RESP-02` | C# so `ErrorCode==99` thay vì `RtnCode==99` | Network error path có thể bị bỏ qua. |
+| `ORD-RESP-03` | C# `OrdID` khác SQL `OrderID`; exception bị nuốt | Parameter/call failure có thể bị che giấu. |
+| `ORD-RESP-04` | Parser chỉ nhận slot 1–4 trong contract 1–5 | Mất error/warning thứ năm. |
+| `ORD-RESP-05` | Import/CAT có đường trả `true` khi stream/reader null | False-success import. |
+| `ORD-RESP-06` | SQL retry dùng `@iTrxStatus` trước assignment | Có thể ghi NULL/fail; cần test trên schema production-like. |
+| `ORD-CODE-02` | Bounds check dùng `>` thay vì `>=` | Index đúng bằng array length có thể throw. |
+| `ORD-CODE-03` | Sell dùng `>=10`, flow khác dùng `>10` | `Ret=10` hiển thị không nhất quán. |
+| `ORD-TXN-01` | Multi-table queue/send/response không có outer transaction; có `NOLOCK`/silent catch | Không có atomicity/consistency guarantee end-to-end. |
 
-Chi tiết mã và bằng chứng mapping: [Order Code Dictionary](code-dictionary.md#9-defect-candidate-liên-quan-tới-mã).
+Mỗi item cần issue/test riêng và xác minh stored procedure/binary production trước khi sửa.
 
 ## 12. Trace nhanh theo symbol
 
-| Chặng | Symbol nên bắt đầu |
+| Chặng | Symbol/path nên bắt đầu |
 |---|---|
-| UI create | `PopupTradeAdd.OnBuy`, `OnSell`, `OnSwitch`, `OnTransfer`, `OnICT` |
-| BLL create | `CTrx.Buy`, `Sell`, `Switch`, `Transfer`, `ICT` |
+| UI create | `WebApp/Main/PopupTradeAdd.aspx.cs`: `OnBuy`, `OnSell`, `OnSwitch`, `OnTransfer`, `OnICT` |
+| BLL create | `DLLs/UBClasses/Trx.cs`: `Buy`, `Sell`, `Switch`, `Transfer`, `ICT` |
 | SQL create | `UBFundTrxBuy`, `UBFundTrxSell`, `UBFundTrxSwitch`, `UBFundTrxTransfer`, `UBFundTrxICT` |
-| Enqueue | `CTrx.OrderPendingMove2Waiting`, `UBOrderWaiting2SendAddInternal`, `IsOrderOK4FS` |
-| Batch | `COrder.OrderFileGenerate`, `UBOrderCreateFile`, `UBOrderCreateMSGXML`, `UBOrderFileUpdateStatus` |
-| Realtime contract | `UBOrderGetMSG`, `UBOrderSetMsgStatus` |
-| Order response | `COrder.ImportXML`, `UBXMLRecOrderRespnProcess`, `UBXMLRecOrderRespnProcessError` |
-| Confirmation | `CAT.ImportXML`, `UBXMLRecTrxRecordProcess1Record`, `FSUBGetTrxStatus`, `FSUBGetTrxWOStatus` |
+| UI route | `WebApp/Main/PopupOrderBatch.aspx.cs` |
+| Enqueue | `OrderPendingMove2Waiting`, `UBOrderWaiting2SendAddInternal`, `UBOrderWaiting2SendAddOne` |
+| Gates | `IsFundFactOKOrder`, `IsOrderOK4FS`, `UBOrderCreateMSGXML(iOptions=2)`, `IsOrderOK4Cash` |
+| Batch | `COrder.OrderFileGenerate`, `UBOrderCreateFile`, `UBOrderFileUpdateStatus` |
+| Realtime | `Services/VieFUNDMQ/Order.cs`, `VieFUNDMQ.SendMsg`, `UBOrderGetMSG`, `UBOrderSetMsgStatus` |
+| Order response | `COrder.ImportXML`, `ProcessXMLErrorSet`, `UBXMLRecOrderRespnProcess*` |
+| Confirmation | `CAT.ImportXML`, `UBXMLRecTrxRecordProcess*`, `FSUBGetTrxStatus`, `FSUBGetTrxWOStatus` |

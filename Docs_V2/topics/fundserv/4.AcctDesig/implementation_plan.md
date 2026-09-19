@@ -1,154 +1,157 @@
-# Review: Gemini Plan cho Section 4 – Client Name Fee Redemptions (DOT 155)
+# DOT 155 — Snapshot reconciliation và verification plan
 
-## Tóm tắt đánh giá
+> Tài liệu này thay cho plan cũ vốn trộn đề xuất, candidate SQL và trạng thái runtime. Nó không xác nhận code/SQL đã deploy.
+>
+> Nhãn dùng theo `Docs_V2/topics/fundserv/README.md:57-87`: **Verified**, **DB/SP-dependent**, **Historical**, **External boundary**.
 
-Sau khi trace toàn bộ source code thực tế, phát hiện **plan của Gemini có một số điểm đúng nhưng cũng có nhiều vấn đề quan trọng cần sửa**. Dưới đây là phân tích chi tiết từng mục.
+## 1. Baseline đã review
 
----
-
-## 1. Những điểm Gemini đề xuất ĐÚNG ✅
-
-### 1.1 `PopupTradeAdd.aspx.cs` – Enforce N$M trên UI
-- ✅ **Đúng**: Cần thêm logic trong `ScreenSellChange()` để force `SettlementMethod = "1"` (N$M) và disable dropdown khi `TrxType = "4"` + `AcctDesig = "1"`.
-- ✅ **Đúng**: Cần thêm server-side validation trong `OnSell()` để chặn phòng thủ.
-- ✅ **Đúng**: `CanPayToClient()` ở [PopupTradeAdd.aspx.cs:850](../../../../WebApp/Main/PopupTradeAdd.aspx.cs#L850) đã tự động trả `false` cho cả Fee Redemption (TrxType=4) và Client Name (AcctDesig=1), nên **không cần sửa** hàm này.
-
-### 1.2 `PopupTradeBasket.aspx.cs` – Out of Scope
-- ✅ **Đúng**: Basket đã block Fee Redemption từ trước → không cần sửa.
-
-### 1.3 `VieFUNDIE` và `UBFFImport` – Không cần sửa C#
-- ✅ **Đúng**: Các thư viện này chỉ đóng vai trò trung chuyển XML, logic nằm ở DB.
-
-### 1.4 `UBOrderCreateMSGXML` / `FSXMLOrderXMLSell` – Không cần sửa
-- ✅ **Đúng**: UDF đã sinh đúng XML theo tham số truyền vào (`<TrxnTyp>`, `<SettlMethd>`).
-
----
-
-## 2. Những điểm Gemini đề xuất SAI hoặc THIẾU ❌
-
-### 2.1 ❌ CRITICAL: Thiếu SP `UBFeeGenerateTrxOneItem` – Block chính của Fee Processing
-
-> [!CAUTION]
-> **Đây là lỗi nghiêm trọng nhất trong plan.** Gemini bỏ sót SP quan trọng nhất trong luồng Fee Processing tự động.
-
-**Phát hiện**: SP [UBFeeGenerateTrxOneItem](../../../../ScriptDB/000_4_CreateSP.sql#L332106) (dòng 332106 trong `000_4_CreateSP.sql`) chứa đoạn code **block cứng** Client Name accounts:
-
-```sql
--- Dòng ~332192 trong SP UBFeeGenerateTrxOneItem
-IF(dbo.IsNomineeDealer(@DSID) = 0)
-BEGIN
-    IF(@AccountDesignation = '1') RETURN; -- Client Account, no processing
-END
-```
-
-**Ý nghĩa**: Khi dealer không phải Nominee dealer (tức là hầu hết các dealer), hệ thống **tự động bỏ qua** (RETURN) tất cả tài khoản Client Name khi chạy fee processing tự động. Điều này có nghĩa là:
-- Dù `GetPlanFeeFundList` trả về đầy đủ vị thế
-- Dù `PanelFeeRedemptionOrder` hiển thị đúng danh sách
-- → **Khi tạo lệnh thực tế, SP này sẽ bỏ qua và không sinh giao dịch**
-
-**Cần sửa**: Phải mở block này cho Fee Redemption (Type=4) của Client Name, đồng thời đảm bảo gán `@SettlementMethod = '1'` (N$M).
-
----
-
-### 2.2 ❌ Sai luồng gọi: Fee Processing KHÔNG gọi `UBFundTrxSell`
-
-> [!WARNING]
-> Gemini sai khi cho rằng sửa `UBFundTrxSell` sẽ ảnh hưởng đến Fee Processing tự động.
-
-**Thực tế call chain**:
-
-```mermaid
-graph TD
-    A["CFeeProcessing.cs (C#)"] -->|"EXEC"| B["UBFeeProcessOnePlan (SP)"]
-    B -->|"EXEC"| C["UBFeeGenerateTrxOneItem (SP)"]
-    C -->|"EXEC"| D["UBFundTrxSellShort (SP) ← Khác UBFundTrxSell!"]
-    
-    E["PopupTradeAdd.aspx.cs (C#)"] -->|"CTrx.Sell()"| F["UBFundTrxSell (SP)"]
-    
-    style C fill:#ff6b6b,color:#fff
-    style D fill:#ffa07a
-    style F fill:#90EE90
-```
-
-| Luồng | SP được gọi | Gemini đề cập? |
+| Baseline | Vai trò | Mức tin cậy cho production |
 |---|---|---|
-| **UI Manual** (PopupTradeAdd) | `UBFundTrxSell` | ✅ Có |
-| **Fee Processing Auto** (CFeeProcessing) | `UBFeeGenerateTrxOneItem` → `UBFundTrxSellShort` | ❌ **Bỏ sót** |
+| C# dưới `WebApp/` và `DLLs/` | Call path/source snapshot hiện có | **Verified** cho repository; binary parity chưa xác nhận |
+| `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql` | SQL tổng snapshot ngày script | **DB/SP-dependent**; không phải deployed definition |
+| Bốn `.sql` trong `Docs_V2/topics/fundserv/4.AcctDesig/` | Candidate patch snapshots | **Historical**; không chứng minh rollout |
+| Deployed DB/UI/test result | Chưa được cung cấp | Unverified |
 
-**Kết luận**: SP `UBFundTrxSell` chỉ ảnh hưởng đến **đặt lệnh thủ công trên PopupTradeAdd**. Luồng Fee Processing tự động đi qua `UBFeeGenerateTrxOneItem` → `UBFundTrxSellShort`, hoàn toàn khác.
+Không chỉnh hoặc chạy trực tiếp candidate `.sql` chỉ dựa trên tài liệu này.
 
----
+## 2. Kết quả reconciliation
 
-### 2.3 ❌ Sai: `UBFundTrxSell` KHÔNG block AcctDesig=1 cho Fee Redemption
+### 2.1 Manual và automatic là hai luồng độc lập
 
-> [!IMPORTANT]
-> Plan của Gemini nói "Loại bỏ điều kiện chặn `@Type = '4'` khi `@AccountDesignation = '1'`" nhưng **điều kiện này không tồn tại** trong SP `UBFundTrxSell`.
+```text
+Manual:
+PopupTradeAdd.OnSell -> CTrx.Sell -> UBFundTrxSell
 
-Sau khi đọc toàn bộ [UBFundTrxSell.sql](UBFundTrxSell.sql), **không có dòng code nào** check `IF(@Type = '4' AND @AccountDesignation = '1')` để block. SP này cho phép tất cả AcctDesig đặt Fee Redemption.
-
-**Tuy nhiên**, việc thêm validation phòng thủ (enforce N$M khi AcctDesig=1 + Type=4) vẫn **đúng và cần thiết** như một defense-in-depth layer.
-
----
-
-### 2.4 ❌ Sai: `PanelPlanFeeSetting.aspx.cs` KHÔNG chứa logic `cbFeeType.Enabled`
-
-Plan Gemini ghi:
-```csharp
-// Trước:
-cbFeeType.Enabled = (AccountDesignation != "1"); // not for client name
-// Sau:
-cbFeeType.Enabled = true;
+Automatic:
+FeeProcessing.cs -> UBFeeProcessOnePlan (hoặc biến thể)
+                 -> UBFeeGenerateTrxOneItem
+                 -> UBFundTrxSellShort
 ```
 
-**Thực tế**: Grep toàn bộ file `PanelPlanFeeSetting.aspx.cs` không tìm thấy bất kỳ reference nào đến `AccountDesignation`, `AccDesig`, `cbFeeType`, hay `FeeType`. File này không chứa logic chặn Client Name. → **Mục này trong plan là phantom code, không tồn tại.**
+Source evidence:
 
----
+- `WebApp/Main/PopupTradeAdd.aspx.cs:3448-3469,3651-3666`
+- `DLLs/UBClasses/Trx.cs:990-1089`
+- `DLLs/UBClasses/FeeProcessing.cs:312-355`
+- `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql:328244-328246,328485-328487`
 
-### 2.5 ⚠️ Thiếu: `PanelFeeRedemptionOrder`, `PanelFeeProcess`, `PanelFeeAddItem` KHÔNG chứa logic AcctDesig
+**Verified:** test `UBFundTrxSell` không bao phủ automatic fee chain; OneItem/SellShort phải được test riêng.
 
-Gemini ghi rằng cần "rà soát và loại bỏ logic lọc chặn Client Name" trong 3 file này, nhưng:
+### 2.2 Candidate snapshots có logic DOT 155 dự kiến
 
-| File | Có chứa logic AcctDesig? |
+- `UBFeeGenerateTrx_Start.sql:35-42`: comment filter Client Name.
+- `UBFeeGenerateTrxOneItem.sql:103-116`: đọc AcctDesig và comment `RETURN` cũ.
+- `UBFeeGenerateTrxOneItem.sql:188-247`: đặt Net/source D/method `1`, chọn type `4` và gọi SellShort.
+- `UBFundTrxSell.sql:163-178`: guard N$M cho manual path, trả `104`.
+- `UBFundTrxSellShort.sql:134-149,215-289`: guard automatic path, phân loại fee và chuyển settlement vào order.
+
+Tất cả các kết luận trên là **Historical snapshot evidence**, không phải deployment evidence.
+
+### 2.3 SQL tổng vẫn thể hiện baseline cũ
+
+- `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql:324042-324045` vẫn lọc `PL.AccountDesignation <> '1'`.
+- `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql:324184-324188` vẫn `RETURN` Client Name trong OneItem.
+
+Do đó không thể vừa coi SQL tổng là source of truth vừa tuyên bố candidate đã tích hợp. Cần lấy definition từ database mục tiêu để giải quyết divergence.
+
+### 2.4 Claim UI cũ không khớp source
+
+`CanPayToClient()` chặn Pay To Client cho type `4`/AcctDesig `1`, nhưng `ScreenSellChange()` không force/disable settlement dropdown. `OnSell()` lấy nguyên dropdown value và không có DOT 155 guard trước BLL.
+
+Source evidence: `WebApp/Main/PopupTradeAdd.aspx.cs:848-854,1008-1055,3448-3469`
+
+Vì vậy:
+
+- bỏ claim “UI đã hoàn thiện”; và
+- coi UI enforcement là gap cần quyết định/verify, không phải task đã done.
+
+### 2.5 `UBFundTrxSellShort` không còn là open trace question
+
+Candidate snapshot đã được trace và có guard tại `UBFundTrxSellShort.sql:134-149`. Open question còn lại là definition nào đang deploy, không phải nội dung candidate file.
+
+### 2.6 Error message chưa được chứng minh
+
+WebApp chuyển DB error `104` thành message index `94`, nhưng source arrays không chứa literal EN/FR từng được plan cũ đề xuất.
+
+Source evidence:
+
+- `WebApp/Main/PopupTradeAdd.aspx.cs:3668-3671`
+- `DLLs/UBStatic/CMSG.cs:197-284`
+
+Không được ghi rằng message cụ thể đã hoạt động nếu chưa test binary/UI deployed.
+
+## 3. Verification plan trước khi quyết định implementation
+
+### Gate A — xác định deployed DB baseline
+
+Owner: DBA/release owner.
+
+1. Lấy `OBJECT_DEFINITION`, modify date và deployment/version record cho:
+   - `UBFeeGenerateTrx_Start`
+   - `UBFeeGenerateTrxOneItem`
+   - `UBFundTrxSell`
+   - `UBFundTrxSellShort`
+2. Diff deployed definitions với SQL tổng và candidate snapshots.
+3. Ghi rõ database/environment, timestamp và hash; chọn một source of truth.
+
+Exit criterion: biết chính xác hai Client Name blocks và hai Ret `104` guards có tồn tại trên DB mục tiêu hay không.
+
+### Gate B — manual path
+
+Owner: WebApp + DB.
+
+1. Trên UI deployed, chọn Client Name và transaction type `4`.
+2. Ghi nhận settlement options, selected value, enabled state và Pay To Client behavior.
+3. Gửi method `1`; xác nhận order lưu type `4`/method `1`.
+4. Gửi method khác `1` bằng test an toàn; xác nhận DB guard và message UI.
+
+Exit criterion: có UI capture, DB row và return/message evidence; không chỉ dựa trên source snapshot.
+
+### Gate C — automatic fee path
+
+Owner: fee processing + DB.
+
+1. Tạo Client Name fee item đủ điều kiện trong test environment.
+2. Xác nhận Start không loại item và OneItem không `RETURN` sớm.
+3. Trace `UBFeeGenerateTrxOneItem` → `UBFundTrxSellShort`.
+4. Xác nhận order/result lưu settlement indicator `N`, source `D` (trừ nhánh intermediary có bằng chứng riêng) và method `1`.
+5. Negative test method khác `1` trực tiếp trên SellShort; mong đợi `104` nếu guard thuộc approved design.
+
+Exit criterion: có SP trace/log và DB assertions cho đúng automatic chain.
+
+### Gate D — outbound và response
+
+Owner: Fundserv integration/release.
+
+1. Đưa manual và automatic orders qua `UBOrderCreateFile`.
+2. Kiểm tra file runtime có envelope V36 và body từ `OrderMSG`.
+3. Kiểm tra các field nghiệp vụ từ deployed SP/UDF, không dùng `sample-co.xml` làm expected body.
+4. Gửi qua test gateway và lưu response/acceptance.
+
+Source evidence cho envelope/body boundary:
+
+- `DLLs/UBFFImport/COrder.cs:20-49,86-121`
+- `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql:464617-464771`
+
+Gateway và Fundserv acceptance là **External boundary**.
+
+## 4. Decision log cần hoàn tất sau verification
+
+| Quyết định | Evidence bắt buộc |
 |---|---|
-| `PanelFeeRedemptionOrder.aspx.cs` | ❌ Không |
-| `PanelFeeProcess.aspx.cs` | ❌ Không |
-| `PanelFeeAddItem.aspx.cs` | ❌ Không |
+| Candidate SQL nào được chấp thuận | Deployed diff + DBA owner |
+| Có cần UI force/disable N$M | UX/business decision + manual-path test |
+| Ret `104` và text EN/FR | Approved mapping + deployed UI test |
+| Automatic Client Name được mở cho dealer nào | Business rule + representative dealer tests |
+| Điều kiện release DOT 155 | Manual, automatic, export và response evidence |
 
-**Logic chặn thực sự nằm ở mức Database** trong SP `UBFeeGenerateTrxOneItem`, không phải trong C# UI code. Các panel này chỉ hiển thị dữ liệu và gọi SP ở backend.
+## 5. Trạng thái cuối của review
 
----
+- **Verified:** call paths và nội dung source/snapshot nêu trên.
+- **Historical:** logic trong bốn candidate `.sql`.
+- **DB/SP-dependent:** behavior cuối, outbound order fields và Ret `104` trên database mục tiêu.
+- **External boundary:** gateway pickup và Fundserv response/acceptance.
+- **Deployment status:** unverified.
 
-### 2.6 ⚠️ Thiếu: `UBFundTrxSellShort` chưa được trace
-
-SP `UBFundTrxSellShort` được gọi bởi `UBFeeGenerateTrxOneItem` khi tạo lệnh fee redemption tự động. Gemini chưa trace SP này để xác nhận nó **không có block tương tự** cho AcctDesig=1.
-
----
-
-## 3. Tổng hợp: Thay đổi thực sự cần làm
-
-### Giai đoạn 1: Database (SQL Server)
-
-| SP/UDF | Thay đổi | Ưu tiên |
-|---|---|---|
-| **`UBFeeGenerateTrxOneItem`** | Mở block `IF(@AccountDesignation = '1') RETURN;` cho fee redemption. Khi `@AccountDesignation = '1'`, vẫn cho phép chạy nhưng enforce `@SettlementMethod = '1'` (N$M) | 🔴 **Cao nhất** |
-| **`UBFundTrxSell`** | Thêm validation phòng thủ: block nếu `@Type='4'` + `@AccDesig='1'` + `@SettlMethod <> '1'` | 🟡 Trung bình |
-| **`UBFundTrxSellShort`** | Cần trace để xác nhận không có block AcctDesig=1 tương tự | 🟡 Cần trace |
-
-### Giai đoạn 2: WebApp UI (C#)
-
-| File | Thay đổi | Ưu tiên |
-|---|---|---|
-| **`PopupTradeAdd.aspx.cs`** | `ScreenSellChange()`: enforce N$M + disable dropdown. `OnSell()`: server-side validation phòng thủ. | 🔴 Cao |
-| **`PanelFeeRedemptionOrder`** | Không cần sửa C# (không có logic block trong code) | ⚪ Không cần |
-| **`PanelFeeProcess`** | Không cần sửa C# (logic nằm ở DB SP) | ⚪ Không cần |
-| **`PanelFeeAddItem`** | Không cần sửa C# (logic nằm ở DB SP) | ⚪ Không cần |
-| **`TrxView.aspx.cs`** | Cần verify filter query hiển thị Fee Redemption cho Client Name | 🟢 Thấp |
-
----
-
-## 4. Open Questions cần giải quyết trước khi code
-
-> [!IMPORTANT]
-> 1. **`UBFundTrxSellShort`**: Cần trace SP này xem có block AcctDesig=1 giống `UBFeeGenerateTrxOneItem` không?
-> 2. **`IsNomineeDealer` logic**: Khi mở block trong `UBFeeGenerateTrxOneItem`, cần hiểu rõ: block hiện tại là `IF(IsNomineeDealer = 0 AND AcctDesig = '1') RETURN`. Có phải mở cho **tất cả** dealer hay chỉ specific dealer types?
-> 3. **SettlementMethod trong `UBFeeGenerateTrxOneItem`**: SP đã hardcode `@SettlementMethod = '1'` (N$M) cho mọi fee redemption. Với V36, cần xác nhận rằng logic này đã đủ hay cần thêm check `AccountDesignation` riêng.
+Không đánh dấu DOT 155 “implemented”, “production ready” hoặc “deployed” cho đến khi Gate A–D có evidence.

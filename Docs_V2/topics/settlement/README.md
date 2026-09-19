@@ -22,10 +22,10 @@ Luồng ngược (unsettle) có rào chắn: không bỏ settle deposit khi tran
 | UI chính | [`SettlementView.aspx`](../../../WebApp/Main/SettlementView.aspx), [`SettlementView.aspx.cs`](../../../WebApp/Main/SettlementView.aspx.cs#L21) | Search, tag, settle/unsettle, cheque, EFT, reminder, plan và listing. |
 | UI phụ | [`SettlementView_ASM.aspx.cs`](../../../WebApp/Main/SettlementView_ASM.aspx.cs), [`SettlementView_Plan.aspx.cs`](../../../WebApp/Main/SettlementView_Plan.aspx.cs), [`SettlementView_Reminder.aspx.cs`](../../../WebApp/Main/SettlementView_Reminder.aspx.cs) | Popup/detail cho ASM, plan và reminder. |
 | In | [`SettlementFilePrn.aspx.cs`](../../../WebApp/Main/SettlementFilePrn.aspx.cs) | Entry point in file/danh sách settlement. |
-| Business/DAL | [`TrustAccount.cs`](../../../UBClasses/TrustAccount.cs#L1649) | Wrapper gọi các SP trust, cheque, EFT, reminder, plan và listing. |
-| ASM/file | [`ASMView.cs`](../../../UBClasses/ASMView.cs#L31), [`CAFFile.cs`](../../../UBClasses/CAFFile.cs#L89) | Danh sách ASM và money-movement/LS file. |
-| EFT file | [`EFT.cs`](../../../UBFFImport/EFT.cs#L16) | Hoàn tất và xuất file EFT ngoài phần chọn/gom item của màn hình. |
-| SQL | [`000_4_CreateSP.sql`](../../../ScriptDB/000_4_CreateSP.sql#L658507) | Nguồn định nghĩa SP trong snapshot repository. |
+| Business/DAL | [`TrustAccount.cs`](../../../DLLs/UBClasses/TrustAccount.cs#L1649) | Wrapper gọi các SP trust, cheque, EFT, reminder, plan và listing. |
+| ASM/file | [`ASMView.cs`](../../../DLLs/UBClasses/ASMView.cs#L31), [`CAFFile.cs`](../../../DLLs/UBClasses/CAFFile.cs#L89) | Danh sách ASM và money-movement/LS file. |
+| EFT file | [`EFT.cs`](../../../DLLs/UBFFImport/EFT.cs#L16) | Hoàn tất và xuất file EFT ngoài phần chọn/gom item của màn hình. |
+| SQL | [`000_4_CreateSP.sql`](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658507) | Nguồn định nghĩa SP trong snapshot repository. |
 
 Không bao gồm `VFCsvExport` theo quyết định phạm vi của dự án.
 
@@ -41,7 +41,7 @@ Các quyền chức năng được kiểm tra cả ở UI và trong SP settle/un
 | Supplier transaction | `1` | `SETTLETRX` | `UB_TrustTrxSelTMP` |
 | Commission | `2` | `COMM` | `UB_TrustCommSelTMP` |
 
-UI disable/hide nút tại [`SettlementView.aspx.cs:437`](../../../WebApp/Main/SettlementView.aspx.cs#L437). `UBTrustSettle` và `UBTrustUnSettleTagged` kiểm tra lại quyền bằng `GetMemberPermission`, vì vậy settle/unsettle hàng loạt không chỉ dựa vào việc ẩn nút ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L658536)).
+UI disable/hide nút tại [`SettlementView.aspx.cs:437`](../../../WebApp/Main/SettlementView.aspx.cs#L437). `UBTrustSettle` và `UBTrustUnSettleTagged` kiểm tra lại quyền bằng `GetMemberPermission`, vì vậy settle/unsettle hàng loạt không chỉ dựa vào việc ẩn nút ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658536)).
 
 Các thao tác quản trị cheque/EFT/listing chủ yếu được chặn bằng việc ẩn tab. Khi thay đổi các handler này cần kiểm tra thêm authorization phía server/SP; không nên coi visibility của Web Forms là ranh giới bảo mật đầy đủ.
 
@@ -67,7 +67,7 @@ Các thao tác quản trị cheque/EFT/listing chủ yếu được chặn bằn
 | `3` | EFT mới. |
 | `4` | Gộp vào EFT còn pending nếu có thể. |
 
-Nếu `iBankAccountID = 0`, `UBTrustSettle` tự hạ `iChequeOpt` về `0`. EFT (`3/4`) chỉ được SP chấp nhận cho settlement mode `1`; mode khác trả lỗi ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L658526)).
+Nếu `iBankAccountID = 0`, `UBTrustSettle` tự hạ `iChequeOpt` về `0`. EFT (`3/4`) chỉ được SP chấp nhận cho settlement mode `1`; mode khác trả lỗi ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658526)).
 
 `DealerSpecifics()` điều chỉnh lựa chọn dựa trên `DealerInfo.iLevel`, `bNSM`, `bASMHide` ([source](../../../WebApp/Main/SettlementView.aspx.cs#L320)):
 
@@ -101,7 +101,7 @@ flowchart LR
 
 ### 5.1. Chọn dòng
 
-`TrustAccount.SelectionUpdate()` ánh xạ `iSP` sang sáu SP selection ([source](../../../UBClasses/TrustAccount.cs#L2045)):
+`TrustAccount.SelectionUpdate()` ánh xạ `iSP` sang sáu SP selection ([source](../../../DLLs/UBClasses/TrustAccount.cs#L2045)):
 
 - `0/1`: header/detail deposit;
 - `2/3`: supplier header/transaction;
@@ -112,7 +112,7 @@ Selection được khóa theo `iUserID`, không theo session ID. Các SP total t
 
 ### 5.2. Deposit
 
-`OnSettleDeposit()` gọi mode `0`, options `1`. `UBTrustSettle` cập nhật tất cả dòng `iStatus=1` nằm trong `UB_TrustINHeaderSelTMP`, ghi `dtSettlement`, `iSettledUserID`, `iLastModifiedUserID`, rồi xóa selection của user ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L658572)).
+`OnSettleDeposit()` gọi mode `0`, options `1`. `UBTrustSettle` cập nhật tất cả dòng `iStatus=1` nằm trong `UB_TrustINHeaderSelTMP`, ghi `dtSettlement`, `iSettledUserID`, `iLastModifiedUserID`, rồi xóa selection của user ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658572)).
 
 ### 5.3. Supplier transaction
 
@@ -122,7 +122,7 @@ Mode `1` xử lý từng dòng đã tag. `UBTrustSettleOne`:
 - tìm deposit qua `iTrustDepositID` hoặc `UB_TrustTrxDetail` và trả `3` nếu deposit phụ thuộc chưa settled;
 - gắn cheque/EFT nếu đã tạo được payment object;
 - cập nhật status/date/user trên `UB_TrustTrx`;
-- có nhánh đặc thù DSID/dealer cho fee, portfolio cash và trust front-end ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L658796)).
+- có nhánh đặc thù DSID/dealer cho fee, portfolio cash và trust front-end ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658796)).
 
 Cheque được gom theo `MgmtCode` trong phạm vi một lần gọi. EFT chỉ được tạo ở nhánh `iType=2`; dòng không tạo được EFT bị bỏ qua. Sau vòng lặp, SP tính lại tổng từ `-UB_TrustTrx.mAmount` và cập nhật `UB_Cheque.mAmount` hoặc `UB_EFTItem.mAmount`.
 
@@ -132,11 +132,11 @@ Mode `2` xử lý từng dòng. `UBTrustSettleOne` gọi `UBCommissionAddFromTru
 
 ### 5.5. Tác động tới order
 
-Sau khi settle thành công, nếu `IsSettledSendOrder(@DSID)=1`, `UBTrustSettle` gom các plan có dòng tiền dương và gọi `UBTrxBuyOrderCheck4Cash2SendOnePlan` ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L658762)). Vì vậy thay đổi settlement có thể làm buy order đủ điều kiện gửi.
+Sau khi settle thành công, nếu `IsSettledSendOrder(@DSID)=1`, `UBTrustSettle` gom các plan có dòng tiền dương và gọi `UBTrxBuyOrderCheck4Cash2SendOnePlan` ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L658762)). Vì vậy thay đổi settlement có thể làm buy order đủ điều kiện gửi.
 
 ## 6. Unsettle và các rào chắn
 
-UI gọi `TrustAccount.UnSettle()` cho một dòng hoặc `UnSettleTagged()` cho danh sách. `UBTrustUnSettle` thực thi các luật chính ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L662561)):
+UI gọi `TrustAccount.UnSettle()` cho một dòng hoặc `UnSettleTagged()` cho danh sách. `UBTrustUnSettle` thực thi các luật chính ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L662561)):
 
 | Điều kiện | Kết quả/return |
 |---|---:|
@@ -160,7 +160,7 @@ Khi được phép, SP đưa trust transaction về status `1`, bỏ liên kết
 | Add/update/delete item | `ChequeItemUpdate/Delete` | `UBTrustChequeItemAdd/Update/Delete` | `UB_ChequeDetail` |
 | Chuyển cheque sang EFT | `Cheque2EFT` | `UBTrustCheque2EFT` | `UB_Cheque`, `UB_EFTItem`, `UB_MGMT`, `UB_Intermediary` |
 
-`UBTrustChequeDelete` từ chối xóa khi còn `UB_TrustTrx` hoặc `UB_ChequeDetail` tham chiếu ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L646804)). `UBTrustCheque2EFT` tìm banking information theo management company, fallback intermediary; trả `4` khi thiếu thông tin và `3` khi EFT liên quan đã process ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L646612)).
+`UBTrustChequeDelete` từ chối xóa khi còn `UB_TrustTrx` hoặc `UB_ChequeDetail` tham chiếu ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L646804)). `UBTrustCheque2EFT` tìm banking information theo management company, fallback intermediary; trả `4` khi thiếu thông tin và `3` khi EFT liên quan đã process ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L646612)).
 
 ## 8. EFT
 
@@ -169,15 +169,15 @@ EFT có hai giai đoạn:
 1. Settlement tạo/gộp dòng pending trong `UB_EFTItem` và gắn trust transaction.
 2. Tab EFT tag các item pending rồi `UBEFTProcessTaggedItems` tạo `UB_EFTFile`, tăng sequence của bank account, snapshot thông tin ngân hàng vào item và chuyển item sang processing.
 
-`UBEFTProcessTaggedItems` chỉ gom item cùng `iTrustBankAccountID`, có amount dương và chưa deleted. Effective date không được nhỏ hơn ngày hiện tại. File name/format phụ thuộc bank account, bank branch, DSID và `iEFTFormat` ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L315747)). Nếu cập nhật item lỗi, `TRY/CATCH` đưa item về pending, xóa header file và giảm sequence.
+`UBEFTProcessTaggedItems` chỉ gom item cùng `iTrustBankAccountID`, có amount dương và chưa deleted. Effective date không được nhỏ hơn ngày hiện tại. File name/format phụ thuộc bank account, bank branch, DSID và `iEFTFormat` ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L315747)). Nếu cập nhật item lỗi, `TRY/CATCH` đưa item về pending, xóa header file và giảm sequence.
 
-Sau đó [`UBFFImport/EFT.cs`](../../../UBFFImport/EFT.cs#L835) đảm nhiệm sinh nội dung file; `UBEFTFileEnd` ghi trạng thái/kết quả. Màn hình chỉ cho download khi `UB_EFTFile.iStatus=2`, có `FileName`, và `iOption>0`; dữ liệu được tải dưới dạng ZIP ([source](../../../WebApp/Main/SettlementView.aspx.cs#L3933)).
+Sau đó [`UBFFImport/EFT.cs`](../../../DLLs/UBFFImport/EFT.cs#L835) đảm nhiệm sinh nội dung file; `UBEFTFileEnd` ghi trạng thái/kết quả. Màn hình chỉ cho download khi `UB_EFTFile.iStatus=2`, có `FileName`, và `iOption>0`; dữ liệu được tải dưới dạng ZIP ([source](../../../WebApp/Main/SettlementView.aspx.cs#L3933)).
 
 Xóa file bằng `UBEFTRemove` không xóa business item mà đưa chúng về pending. “Reset/regenerate” gọi `UBEFTFileEnd` với `iStatus=0`.
 
 ### EFT Reminder
 
-Reminder dùng `UB_EFTReminderHeader` theo plan và `UB_EFTReminderItem` theo trust transaction. `UBEFTReminderAdd` không thêm reminder nếu plan đã có dòng paid-to-client mới hơn; `UBEFTReminderList` yêu cầu admin ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L316026)).
+Reminder dùng `UB_EFTReminderHeader` theo plan và `UB_EFTReminderItem` theo trust transaction. `UBEFTReminderAdd` không thêm reminder nếu plan đã có dòng paid-to-client mới hơn; `UBEFTReminderList` yêu cầu admin ([SQL](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql#L316026)).
 
 ## 9. ASM, Plan, Listing và output
 
@@ -251,7 +251,8 @@ UI ẩn các tab quản trị cho non-admin, nhưng nhiều wrapper/SP cheque/EF
 
 - [FundServ Files DataFlow](../fundserv/files-dataflow.md)
 - [Trading & Orders](../trading-orders/module-guide.md)
-- [Commission & Fee](../commission-fee/module-guide.md)
+- [Payment Business Guide](../commission-fee/payment-business-guide.md)
+- [Commission & Fee — Module Guide](../commission-fee/module-guide.md)
 - [PDF Workflow](../../viefund-framework/pdf/pdf-workflow.md)
 - [Database Access](../../viefund-framework/database-access.md)
 - [Data Dictionary](../../reference/data-dictionary.md)

@@ -1,400 +1,291 @@
 # 03 — Trading & Orders (Module Guide)
 
-> Module giao dịch mua/bán quỹ đầu tư — trái tim của hệ thống VieFUND.
-> **Đối tượng**: Developer .NET cần hiểu flow giao dịch end-to-end.
+> Module giao dịch mutual fund, ETF/stock và transaction thủ công trong VieFUND. Đối tượng chính là developer .NET cần hiểu entry point, routing và ranh giới giữa behavior đã trace với narrative nghiệp vụ.
 
-> **Tài liệu source-audit chuyên sâu**: [Order end-to-end](order-end-to-end.md) nối UI/BLL/SP/DB và [Order Code Dictionary](code-dictionary.md) giải thích `Ret`, FundServ code, status/action/type cùng DSID/dealer hard-code. Hai file này là nguồn ưu tiên khi cần xác minh runtime behavior; phần narrative cũ bên dưới dùng để đọc tổng quan module.
+## 0. Baseline và cách đọc bằng chứng
+
+Audit này dùng:
+
+- `WebApp/`, `DLLs/`, `Services/` cho source C# legacy;
+- `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_3_CreateUDF.sql` và `000_4_CreateSP.sql` cho SQL snapshot.
+
+Repository có source copy gần trùng dưới `MyPortfolioNew/VieFUND-Platform/src`; không có artefact xác định copy/binary/DB nào đang deploy. SQL snapshot không chứa base `CREATE TABLE` hoặc seed cho các lookup chính, nên tài liệu chỉ gọi một table/column là **đã quan sát qua usage**, không suy ra schema constraint hay label production.
+
+[Order end-to-end](order-end-to-end.md) là trace pipeline chi tiết. [Order Code Dictionary](code-dictionary.md) là nguồn ưu tiên khi đọc `Ret`, FundServ code, status/action/type và hard-code.
 
 ---
 
-## 1. Tổng quan nghiệp vụ
+## 1. Phạm vi module
 
-Hệ thống xử lý giao dịch mutual fund, ETF và stock cho các investment dealers tại Canada. Mỗi giao dịch đi qua vòng đời: tạo order → compliance check → gửi FundServ/FIX → nhận phản hồi → settlement.
+Source cho thấy các đường chính:
 
-> **Nguồn**: `business-logic-topics/fundserv-order-flow.md` — "Fund Companies ⬄ FundServ ⬄ Back Office System (like VieFUND)"
+1. UI tạo Buy/Sell/Switch/Transfer/ICT gọi `CTrx` và các SP `UBFundTrx*`.
+2. Mutual-fund electronic order được đưa qua validation, queue, CO file hoặc realtime IBM MQ, rồi nhận order response và CAT confirmation.
+3. Network `4` dùng BBS/FIX routing, nhưng có nhiều entry point tạo order khác nhau.
+4. Manual transaction và network `2` có contract khác electronic FundServ order.
 
----
+Không nên áp một lifecycle duy nhất cho mọi order chỉ vì cùng dùng `UB_FundTrxOrder`.
 
-## 2. Các loại giao dịch (Transaction Types)
+## 2. Các loại giao dịch và entry point
 
-| Loại | BLL Method | SP | Mô tả |
+| Loại | Entry point → BLL | SP chính | Ghi chú đã source-verify |
 |---|---|---|---|
-| **Buy** | `CTrx.Buy()` | `UBFundTrxBuy` | Mua units. Client đưa tiền → nhận units |
-| **Buy Edit** | `CTrx.BuyEdit()` | `UBFundTrxBuyEdit` | Sửa order Buy đang pending |
-| **Sell** | `CTrx.Sell()` | `UBFundTrxSell` | Bán units → nhận tiền |
-| **Sell Edit** | `CTrx.SellEdit()` | `UBFundTrxSellEdit` | Sửa order Sell |
-| **Switch** | `CTrx.Switch()` | `UBFundTrxSwitch` | Chuyển fund A → fund B cùng company |
-| **Switch Edit** | `CTrx.SwitchEdit()` | `UBFundTrxSwitchEdit` | Sửa order Switch |
-| **BasketSwitch** | `CTrx.BasketSwitch()` | `UBFundTrxSwitchBasket` | Switch hàng loạt cho nhiều clients |
-| **Transfer** | `CTrx.Transfer()` | `UBFundTrxTransfer` | Chuyển giữa plans (internal/external) |
-| **Transfer Edit** | `CTrx.TransferEdit()` | `UBFundTrxTransferEdit` | Sửa order Transfer |
-| **ICT** | `CTrx.ICT()` | `UBFundTrxICT` | Inter-Company Transfer — chuyển giữa accounts cùng plan |
-| **ICT Edit** | `CTrx.ICTEdit()` | `UBFundTrxICTEdit` | Sửa order ICT |
-| **Stock/ETF** | `CTrx.StockOrderAdd()` | `UBStockOrderAdd` | Order ETF/stock qua FIX protocol |
-| **Manual Trx** | `CTrx.ManualUpdate()` | `UBFundTrxManualAdd/Update` | Nhập giao dịch thủ công (admin) |
-
-> **Nguồn**: `UBClasses/Trx.cs` — methods `Buy()` (L598-740), `Sell()` (L985-1114), `Switch()` (L1232-1357), `Transfer()` (L1592-1708), `ICT()` (L1816-1895), `StockOrderAdd()` (L741-806), `ManualUpdate()` (L3058-3075)
-
----
-
-## 3. Vòng đời giao dịch (Order Lifecycle)
-
-```
-┌─────────┐     ┌──────────────────┐     ┌──────────┐     ┌────────────┐     ┌───────────┐
-│ Pending │────▶│Pending to Receive│────▶│ Accepted │────▶│ Contracted │────▶│ Confirmed │
-└─────────┘     └──────────────────┘     └──────────┘     └────────────┘     └───────────┘
-     │                  │                     │            T+1 (FS file)     T+2 (TS file)
-     │             ┌────┘                ┌────┘                                    ▲
-     ▼             ▼                     ▼                                         │
- [Delete]      [Rejected]           [Rejected]         non-cash trx: T+1 ──────────┘
-                                                       (bỏ qua Contracted)
-```
-
-### Chi tiết từng bước
-
-| Bước | Trạng thái | Trigger | Mô tả |
-|---|---|---|---|
-| 1 | **Pending** | User submit trade | Order được tạo trong DB |
-| 2 | **Pending to Receive** | Gửi qua FundServ (Interactive/Batch) | Order rời hệ thống |
-| 3a | **Accepted** | Response từ FundServ | Fund company chấp nhận |
-| 3b | **Rejected** | Response từ FundServ/Fund Co | Bị từ chối — có error code |
-| 4 | **Contracted** | T+1: FS file (settlement file) | Giá (NAV) đã xác định, units tính được |
-| 5 | **Confirmed** | T+2: TS file | Settlement hoàn tất |
-
-> ⚠️ **Ngoại lệ non-cash trx**: khi xử lý FS file ở T+1, chỉ cash trx mới chuyển sang `Contracted`. **Non-cash trx nhảy thẳng sang `Confirmed`**, không đi qua `Contracted` và không chờ TS file ở T+2.
-
-> **Nguồn**: `business-logic-topics/fundserv-order-flow.md` — "FS file is the settlement file. The trx will have the status 'Contracted' except non-cash trx, which will have the Status 'Confirmed'... On T+2 TS file comes and the trx status changed to 'Confirmed'"
-
-### Hai chế độ gửi order
-
-| Chế độ | Cách thức | Mô tả |
-|---|---|---|
-| **Interactive** (Real-time) | IBM MQ | Gửi từng order, response gần như ngay lập tức. Project: `VieFUNDMQLib` |
-| **Batch** | XML file (CO file) | Gom orders thành file, upload lên FundServ cuối ngày |
-
-> **Nguồn**: `business-logic-topics/fundserv-order-flow.md` — "Interactive (real time): using IBM Websphere Msg Queue... Batch: order file (called CO file)"
-
----
-
-## 4. Error Correction (Sửa lỗi giao dịch)
-
-### 4.1. CAX — Cancel
-
-Hủy giao dịch đã **Contracted nhưng chưa settle**.
-
-Lưu ý phân biệt: order còn ở trạng thái `Pending` thì dùng **DEL** (xóa) hoặc **CAN** (cancel), không phải CAX. `AllowableAction()` trả về `iCanDEL`, `iCanCAN`, `iCanCAX` là ba flag riêng biệt — mỗi trạng thái order cho phép một tập action khác nhau.
-
-> **Nguồn**: `business-logic-topics/error-correction.md` — "When cancelling a contract trade (not settled yet), then that action is CAX"
-
-### 4.2. REV — Reversal
-
-Đảo ngược giao dịch **đã settle**. Tạo giao dịch ngược lại.
-
-> **Nguồn**: `business-logic-topics/error-correction.md` — "REV: reversal is a cancellation of a valid trade. The trade is already settled"
-
-### 4.3. AOT — As of Trade
-
-Order "back-dated" — dùng giá (NAV) của ngày trước đó.
-
-> **Nguồn**: `business-logic-topics/error-correction.md` — "AOT: As of Trade: basically it is a back dated order. For example: Today is April 25 but I order for April 15 trade date."
-
-### 4.4. Dilution
-
-Chênh lệch giá mà dealer phải chịu khi AOT/REV/CAX:
-
-> **Ví dụ** (từ `business-logic-topics/error-correction.md`):
-> April 15: Joe mua fund "A" 50 units × $10 = $500
-> April 25: REV → giá $8 → shortfall = $100 → **dilution = $100** dealer phải trả.
-
-### Code xử lý
-
-```
-AllowableAction() → SP UBFundTrxOrderCANCAX
-  Returns: iCanDEL, iCanCAN, iCanCAX, iCanREV, iCanCHG, iCanUndo
-```
-
-Ngoài các flag trên, SP còn trả `iReasonID`, `iOrderStatus`, `WONumber`.
-
-> **Nguồn**: `Trx.cs` L807-858 — `AllowableAction()` method (SP set tại L820)
-
----
-
-## 5. UI Flow — Tạo giao dịch mới
-
-### Entry point: `PopupTradeAdd.aspx` (156KB markup + 233KB code-behind)
-
-#### 5.1. Layout chính
-
-UI là popup window, chia thành **tabs** cho từng loại giao dịch:
-
-| Tab | View | Controls chính |
-|---|---|---|
-| **Buy** | `ViewBuy` | Fund account, Amount type, Amount, Settlement, Payment info, Trust account |
-| **Sell** | `ViewSell` | Trx type (Sell/Redeem), Amount, Cheque payee info |
-| **Switch** | `ViewSwitch` | Account From (current), Account To (dropdown), Amount |
-| **Transfer** | `ViewTransfer` | Transfer type, Dealer code, Plan type, SIN, Fund info |
-| **ICT** | `ViewICT` | Account From list, Account To list (multi-fund selection) |
-
-> **Nguồn**: `WebApp/Main/PopupTradeAdd.aspx.cs` L42-54 — tab declarations `idTabBuy`, `idTabSell`, `idTabSwitch`, `idTabTransfer`, `idTabICT`. Có thêm `idTabRisk` (L59) không thuộc nhóm trade type.
-
-#### 5.2. Page_Load flow
-
-Toàn bộ phần dưới đây nằm trong nhánh `if (!IsPostBack)`:
-
-```
-L427  1. Validate page   → CBase.IsPageValid(this, "PageClose.aspx", 0, Lg, 0, false)
-L469  2. Load combos     → CBase.LoadSimpleDropDownListArray(this, "UBTrxAddComboList", ...)
-L472  3. Dealer settings  → Dealer.GetDealershipData(ref iLevel, ref bNSM, ref iMember, ref iTrustAccount)
-L445+ 4. Dealer-specific customizations theo DSID (xem 5.3)
-L564  5. Load client info → CCustomer.UpdateClientInfoHeader()
-L614  6. Load plan list   → CCustomer.UpdateClientPlanListCB()
-L617  7. Set defaults     → UpdateSettlementMethodBox(0), ReloadBankAccountList()
-L620  8. Load pending     → UpdatePendingOrderList() + UpdateTrxList(0) + UpdateTrxList(1)
-L638  9. Check access     → CBase.IsAccessible(this, Lg, "ADD", "ACCOUNT", true)
-                          + CBase.IsDisable(this, Lg, "", "TRADING", true)
-```
-
-> ⚠️ Combos và dealer settings được load **trước** client info, không phải sau. Nhiều đoạn customization theo DSID chạy xen giữa các bước này nên thứ tự dòng không liên tục.
-
-> **Nguồn**: `WebApp/Main/PopupTradeAdd.aspx.cs` L424-728 — `Page_Load()` method
-
-#### 5.3. Dealer-specific customizations
-
-Code chứa nhiều DSID hardcode cho từng dealer:
-
-| DSID | Dealer | Customization |
-|---|---|---|
-| `1911`, `2262` | — | Disable ETF price type/time in force |
-| `1256` | EA | Hide SIN/DOB trên order receipt, remove Bulk Cheque/EFT |
-| `1623` | — | Hide Fund Fact requirement |
-| `1853`, `2301` | Merici, Global | Auto-check CR518_519 |
-| `1274`, `1001` | CWM | Show Extra Admin Fee (admin only) |
-
-DSID `1911` còn xuất hiện ở nhiều chỗ khác ngoài `Page_Load` — luôn force Gross khi Buy (`ForceGrossBuy()` tại L536, L734, L1146, L1730, L1760). DSID `1912` force Intermediary settled khi dùng trust account (L748).
-
-> **Nguồn**: `PopupTradeAdd.aspx.cs` L445-677 (`Page_Load`), L5251 (`1853`/`2301` skip validation)
-
----
-
-## 6. Tham số giao dịch quan trọng
-
-### 6.1. Buy parameters (CTrx.Buy — ~62 params)
-
-| Nhóm | Params | Mô tả |
-|---|---|---|
-| **Core** | `iClientID`, `iPlanID`, `iPositionID`, `fAmount`, `AmtType` | Ai mua, ở plan nào, fund nào, bao nhiêu |
-| **Settlement** | `SettlementInd` (G/N), `SettlementStatus`, `SettlementSource` (D/I/F), `SettlementMethod` | Thanh toán gross/net, dealer/intermediary/fund settled |
-| **Compliance** | `bTrxLeveraged`, `bPEFP`, `bUnsolicited`, `bForceApproved`, `bForceRisk` | Flags compliance |
-| **AOT** | `bAOT`, `AOTDateStr`, `bAOTOrginalOrder`, `AOTDilution` | As-of-trade params |
-| **Trust** | `bTrust`, `iTrustID` | Trust account settlement |
-| **Payment** | `iPMTType`, `iBankAccountID`, `BankCode`, `BankTransitNumber`... | EFT/Cheque details |
-| **ETF** | `ETFOrderType`, `ETFTimeInForce`, `ETFExpiryDate`, `mETFPriceLimit`, `mETFPriceStop` | ETF-specific |
-
-> **Nguồn**: `Trx.cs` L598-616 — `Buy()` method signature; L633-710 — `AddParam()` mapping sang SP `UBFundTrxBuy`
-
-### 6.2. Switch đặc biệt
-
-Switch có thêm: `iPositionIDFrom`, `iPositionIDTo`, `TaxEventInd`, `iForceOpt`
-
-```csharp
-// iForceOpt: 1 switch from DSC to FEL, 2 currency switch
-```
-
-> **Nguồn**: `Trx.cs` L1250 — comment trong `Switch()` method
-
-### 6.3. Transfer đặc biệt
-
-Transfer có `iMethod` (internal/external) và thông tin bên nhận: `DealerCodeFrom`, `DealerAcctIDFrom`, `FundAcctIDFrom`, `SIN1From`, `PlanDesignationFrom`, `IntermediaryCodeFrom`...
-
-> **Nguồn**: `Trx.cs` L1592-1609 — `Transfer()` method signature
-
----
-
-## 7. ETF/Stock Trading
-
-ETF không đi qua FundServ mà qua **FIX protocol** đến stock exchange.
-
-### Đặc điểm
-
-- Dealer có **omnibus account** tại trading company
-- Orders có thể gộp (bundled) nếu cùng symbol + properties
-- Chỉ whole units (không fraction)
-- Fund products có `MgmtCode = "ETF"`, `FundID = Symbol/Ticker`
-- Order side: bảng `UB_Def_StockSide` (chỉ dùng Buy/Sell, không dùng hết các side)
-- Order types: bảng `UB_Def_StockOrderType` — dealers **chỉ dùng** Market, Limit, Stop, Stop-Limit (bảng còn nhiều loại khác)
-- TimeInForce: bảng `UB_Def_StockTimeInForce` — dealers **chỉ dùng** Day, Good Till Cancel, Good Till Day
-
-> **Nguồn**: `business-logic-topics/etf-transfer.md` — "ETF is traded on stock exchange... the trades do not go through FundServ, instead it goes via a third-party stock trading company"
-
-### ETF Transfer rules
-
-- Transfer giữa nominee plans cùng client
-- Chỉ cho phép trade date = last business date
-- Amount type: Units, %, $
-- Tạo 2-sided trx: Transfer Out + Transfer In
-- Cross plan-type transfer có tax implications:
-  - OPEN → Registered: set Taxable flag trên To side
-  - Registered → OPEN: flag trên Transfer Out
-  - TFSA → RRSP: flag cả 2 sides
-
-> **Nguồn**: `business-logic-topics/etf-transfer.md` — phần "Transfer:" trở xuống
-
----
-
-## 8. Pending Orders Management
-
-### Xem pending orders
-
-```
-CTrx.GetPendingOrderList() → SP UBTrxPendingOrderList   (L2447, SP tại L2498)
-CTrx.GetOrderPendingSet()  → SP UBOrderPendingList      (L3855, SP tại L3879)
-```
-
-### Actions trên pending orders
-
-| Method | SP | Mô tả |
-|---|---|---|
-| `OrderPendingMove2Waiting()` | `UBOrderWaiting2SendAdd` | Chuyển orders sang trạng thái Waiting |
-| `OrderPending2Confirm()` | `UBOrderSetConfirmTaggedItems` | Confirm orders (admin) |
-| `OrderPendingMove2BBS()` | `UBOrderWaiting2BBSOrder` | Chuyển sang BBS (Batch) |
-| `TrxOrderDelete()` | `UBTrxOrderRemove` | Xóa order |
-| `TrxDeleteOrUndo()` / `TrxDeleteOrUndo2()` | `UBTrxDeleteOrUndo` | Toggle: valid ⬄ deleted |
-| `TrxOrderCANCAX()` | `UBFundTrxCancel` | Cancel/CAX order (`iOptions` = action) |
-| `AllowableAction()` | `UBFundTrxOrderCANCAX` | **Chỉ query** action nào được phép, không thực thi |
-
-> ⚠️ Dễ nhầm: `UBFundTrxOrderCANCAX` **không** phải SP của `TrxOrderCANCAX()`. Nó thuộc `AllowableAction()` (L820) và chỉ trả về các flag cho phép. SP thực thi cancel là `UBFundTrxCancel` (L3338).
-
-> **Nguồn**: `Trx.cs` — `TrxOrderDelete()` L3228, `TrxDeleteOrUndo()` L3280, `TrxOrderCANCAX()` L3335, `OrderPendingMove2Waiting()` L3968, `OrderPending2Confirm()` L4026, `OrderPendingMove2BBS()` L4084
-
----
-
-## 9. Transaction View & Search
-
-| Page | Size | Chức năng |
-|---|---|---|
-| `TrxView.aspx` | 104KB/96KB | Xem danh sách transactions với search, sort, paging |
-| `TrxConfirmationView.aspx` | 66KB/69KB | Xem chi tiết confirmation |
-| `PopupTradeEdit.aspx` | 79KB/151KB | Sửa order đang pending |
-| `PopupPlanTrx.aspx` | 40KB/34KB | Xem transactions của plan |
-
-Search flow: `CTrx.GetViewList()` → SP `UBTrxViewSearch` với params: FileID, Name, Phone, PlanNumber, AccountNumber, WONumber, DateRange, TrxStatus, TrxType, Currency, paging/sorting.
-
-> **Nguồn**: `Trx.cs` L2054-2062 — `GetViewList()` signature; SP `UBTrxViewSearch` set tại L2082
-
----
-
-## 10. Manual Transactions
-
-Admin có thể nhập giao dịch thủ công (VD: import từ hệ thống cũ, adjustment):
-
-```
-CTrx.ManualUpdate() → SP UBFundTrxManualAdd (new) / UBFundTrxManualUpdate (edit)
-```
-
-Manual trx có thêm: `fGAmount`, `fNAmount`, `fPrice`, `fUnits`, `fSettledAmount`, `TradeDate`, `ProcessingDate`, `SettlementDate`, commission fields, DSC, fees, tax, dilution...
-
-> **Nguồn**: `Trx.cs` L3058-3075 — `ManualUpdate()` signature. SP name chọn tại L3080: `iTrxID > 0 ? "UBFundTrxManualUpdate" : "UBFundTrxManualAdd"`. Ngoài ra có `UBFundTrxManualCalc` (L3012) để tính trước units/amount.
-
----
-
-## 11. Stored Procedures liên quan
-
-**81 SP** duy nhất được gọi từ `Trx.cs`. Các nhóm chính:
-
-| Prefix | Số lượng | Chức năng |
-|---|---|---|
-| `UBTrx*` | 26 | View, search, pending list, info, status, schedule |
-| `UBFundTrx*` | 20 | Core trading: Buy/Sell/Switch/Transfer/ICT + Edit/Basket/Manual variants |
-| `UBOrder*` | 19 | Order management: pending, waiting, conversion, history, status |
-| `UBBasket*` | 7 | Basket operations |
-| `UBStock*` | 1 | Stock/ETF order (`UBStockOrderAdd`) |
-| Khác | 8 | `UBPlanTrxList`, `UBPlanMFList`, `UBMFTrxListWithAvgCost`, `UBScheduleRunList`, `UBTradePermissionData`, `UBTrustTransferTrxRefresh`, `UBTSFileAddTrx2Waiting`, `UBPlanTrx2SidedWithFeeCommList` |
-
-> ⚠️ **Không có SP `UBAA*` nào trong `Trx.cs`.** Các SP Asset Allocation / Rebalancing nằm ở `UBClasses/AssetAllocation.cs`, là module riêng.
-
-> **Nguồn**: `Trx.cs` gọi SP theo 2 cách, cần grep cả hai mới đủ:
-> - `db.SetSP("...")` với literal — 64 SP
-> - `string SPName = "..."` rồi `db.SetSP(SPName)` — 17 SP (VD L3231, L3287, L3338, L3974, L4033, L4090)
->
-> Chỉ grep `db.SetSP` sẽ bỏ sót 17 SP thuộc nhóm thứ hai.
-
----
-
-## 12. Related UI Pages
-
-| Page | Size (KB) | Chức năng |
-|---|---|---|
-| `PopupTradeAdd.aspx(.cs)` | 156 / 233 | **Tạo trade mới** — entry point chính |
-| `PopupTradeEdit.aspx(.cs)` | 79 / 151 | Sửa trade pending |
-| `PopupTradeBasket.aspx(.cs)` | 116 / 174 | Basket trading (multi-client switch) |
-| `TrxView.aspx(.cs)` | 104 / 96 | Transaction search & view |
-| `TrxConfirmationView.aspx(.cs)` | 66 / 69 | Chi tiết confirmation |
-| `PopupTrxManualAdd.aspx(.cs)` | 1 / 57 | Nhập manual transaction |
-| `PopupPlanTrx.aspx(.cs)` | 40 / 34 | Plan transactions |
-| `TrxApprovalBox.aspx(.cs)` | 4 / 5 | Compliance approval |
-| `PanelTrxViewSearch.aspx(.cs)` | 16 / 8 | Search panel |
-| `PanelStockTrxEdit.aspx(.cs)` | 12 / 17 | ETF/Stock order edit |
-
-> **Nguồn**: File listing từ `WebApp/Main/` directory
-
----
-
-## 13. Settlement (Thanh toán)
-
-### Settlement Indicator (Gross/Net)
-
-- **G (Gross)**: Dealer thanh toán toàn bộ số tiền cho fund company
-- **N (Net)**: Trừ commission trước khi thanh toán
-
-### Settlement Source
-
-- **D (Dealer)**: Dealer settled — tiền đi qua dealer
-- **I (Intermediary)**: Intermediary settled
-- **F (Fund)**: Fund company settled trực tiếp
-
-> ⚠️ Bất đối xứng Buy vs Sell: tab Buy có đủ 3 radio `rbSettlSrcBuy_D/_I/_F`, nhưng tab Sell **chỉ có D và I** (`rbSettlSrcSell_D`, `rbSettlSrcSell_I`) — không có option Fund settled khi bán.
-
-### Settlement Method
-
-| Value | Method | Ghi chú |
-|---|---|---|
-| 1 | Net Settlement (N$M) | |
-| 2 | Bulk Cheque | Bị remove với DSID `1256` (EA) |
-| 3 | Individual Cheque | |
-| 4 | Bulk EFT | Bị remove với DSID `1256` (EA) |
-| 5 | Individual EFT | |
-| 6 | Other | **Luôn bị remove** khỏi dropdown Buy và Sell |
-| 7 | A$M | **Luôn bị remove** khỏi dropdown Buy và Sell |
-
-Danh sách gốc lấy từ DB qua `CBase.DisplaySettlementMethodDropDownList()` → SP `UBTrxSettleMethodListByPlanID` (lọc theo plan), sau đó code-behind mới remove item 6/7.
-
-> **Nguồn**: `PopupTradeAdd.aspx.cs` L679-689 — `CBase.RemoveDropdownItem()` cho value 6 (Other), 7 (A$M), và 2/4 riêng cho DSID 1256; `CBase.cs` L8201 — `DisplaySettlementMethodDropDownList()`; `Trx.cs` — params `SettlementInd`, `SettlementStatus`, `SettlementSource`, `SettlementMethod`
->
-> Lưu ý: comment ở `PopupTradeAdd.aspx.cs` L678 (`// remove A$M, Bulk check and bulk EFT`) đã lỗi thời — code bên dưới chỉ remove 6 và 7.
-
----
-
-## 14. Pricing
-
-| Loại sản phẩm | Cách định giá | Thời điểm |
-|---|---|---|
-| **Mutual Fund** | NAV (fund company đánh giá sau 4pm) | Tối cùng ngày hoặc sáng hôm sau |
-| **ETF** | Giá sàn (market price) | Real-time khi order executed |
-| **GIC** | Rate hàng ngày (từ CANNEX) | Import sáng, valid cả ngày |
-
-Nguồn price file: mutual fund qua **RS file** từ FundServ; ETF qua **Fundata** (một số dealer import format riêng); GIC rate qua **CANNEX** (sftp).
-
-> **Nguồn**: `business-logic-topics/fundserv-order-flow.md` — "Mutual fund price is evaluated after 4 pm... ETF: it is like stock... GIC: the product rate is updated on a daily basis"
-
----
-
-## 15. Cross-references
-
-| Tài liệu | Liên quan |
+| Buy | `PopupTradeAdd.OnBuy` → `CTrx.Buy` | `UBFundTrxBuy` | Regular buy, rebate và network-specific branch nằm trong SP. |
+| Buy Edit | `CTrx.BuyEdit` | `UBFundTrxBuyEdit` | Sửa order hiện hữu. |
+| Sell | `PopupTradeAdd.OnSell` → `CTrx.Sell` | `UBFundTrxSell` | Main `Type='4'` path collapse về `iType=20`; không dùng riêng value này như label toàn cục cho fee redemption. Canonical `UBFundTrxSellShort` phân biệt blank `ProdEventInd` → `iType=20` (`fee`) và `ProdEventInd='O'` → `iType=90` (`fee redemption`). |
+| Sell Edit | `CTrx.SellEdit` | `UBFundTrxSellEdit` | Sửa Sell. |
+| Switch | `PopupTradeAdd.OnSwitch` → `CTrx.Switch` | `UBFundTrxSwitch` | Có source/destination position và tax/force options. |
+| Switch Edit/Basket | `CTrx.SwitchEdit` / `BasketSwitch` | `UBFundTrxSwitchEdit` / `UBFundTrxSwitchBasket` | Basket là flow riêng. |
+| Transfer | `PopupTradeAdd.OnTransfer` → `CTrx.Transfer` | `UBFundTrxTransfer` | Internal/external branch; không có một `iType` duy nhất. |
+| Transfer Edit | `CTrx.TransferEdit` | `UBFundTrxTransferEdit` | Sửa Transfer. |
+| ICT | `PopupTradeAdd.OnICT` → `CTrx.ICT` | `UBFundTrxICT` | Account-to-account flow, stage source/destination funds qua session. Tên mở rộng và constraint “cùng plan” cần lookup/business owner để xác nhận. |
+| ICT Edit | `CTrx.ICTEdit` | `UBFundTrxICTEdit` | Sửa ICT. |
+| ETF qua trade tabs | `PopupTradeAdd.OnBuy/OnSell` → `CTrx.Buy/Sell` | `UBFundTrxBuy/Sell` | Khi `iNetwork=4`, UI truyền ETF fields; order đi BBS/FIX route ở bước sau. |
+| Standalone stock order | `PanelStockOrder` → `CTrx.StockOrderAdd` | `UBStockOrderAdd` | Entry point riêng; không đại diện cho mọi ETF order. |
+| Manual transaction | `PopupTrxManualAdd` → `CTrx.ManualUpdate` | `UBFundTrxManualAdd/Update` | Access được kiểm bằng `IsAccessible(..., "ADD", "ACCOUNT")`; không có bằng chứng đây luôn là quyền admin. |
+
+Source chính: `DLLs/UBClasses/Trx.cs`, `WebApp/Main/PopupTradeAdd.aspx.cs`, `WebApp/Main/PanelStockOrder.aspx.cs`, `WebApp/Main/PopupTrxManualAdd.aspx.cs`.
+
+## 3. Status và lifecycle
+
+### 3.1. Hai namespace status
+
+| Order status: `UB_FundTrxOrder.iOrderStatus` | Transaction status: `UB_FundTrx.iStatus` |
 |---|---|
-| `Domain Glossary` | Định nghĩa thuật ngữ: Trx, NAV, Settlement, AOT, REV... |
-| `System Map` | Vị trí `Trx.cs` trong architecture |
-| `business-logic-topics/error-correction.md` | AOT/REV/CAX chi tiết + ví dụ dilution |
-| `business-logic-topics/fundserv-order-flow.md` | Order lifecycle, pricing, FundServ modes |
-| `business-logic-topics/etf-transfer.md` | ETF transfer rules, omnibus, FIX protocol |
-| `Database/Table_Description.md` | Schema `UB_Def_StockOrderType`, `UB_Def_StockTimeInForce`, `UB_Def_TrxStatus` |
+| `0` Deleted/null | `0` Deleted |
+| `1` Pending To Send | `1` Rejected |
+| `2` Pending to Receive | `2` Cancelled |
+| `3` Rejected | `3` Pending |
+| `4` Accepted | `4` In Progress |
+| `5` Contracted | `5` Contracted |
+| `6` Confirmed | `6` Confirmed |
+
+`UB_FundTrx` còn có cột integration `iOrderStatus`; khi gửi, SQL có thể đổi cột này sang `2` trong khi business `iStatus` vẫn là `3`. Không map các cột chỉ dựa vào cùng tên/số.
+
+### 3.2. Transition được code/SQL chứng minh
+
+```text
+Order 1 Pending To Send
+  → 2 Pending to Receive khi send-status SP chạy
+  → 4 Accepted hoặc 3 Rejected khi ORDSET được xử lý
+  → 5 Contracted / 6 Confirmed / 3 Rejected khi CAT record được xử lý
+```
+
+Trước CAT dispatch, SQL normalize status trống theo record type:
+
+- `SETTLREC` trống → `A` → Contracted (`5`);
+- `TRXNREC` trống → `S` → Confirmed (`6`).
+
+UDF `FSUBGetTrxStatus`/`FSUBGetTrxWOStatus` map `A`, `S`/blank và `R`. Label hiển thị production vẫn phụ thuộc lookup data không có seed trong repository.
+
+### 3.3. T+1/T+2 là bối cảnh vận hành
+
+Các tài liệu nghiệp vụ cũ mô tả FS ở T+1, TS ở T+2 và non-cash có thể bỏ qua Contracted. Source/SQL snapshot được audit chỉ chứng minh message type, normalization và mapping status; không có scheduler hoặc branch đủ để khẳng định lịch này là DB-enforced. Khi troubleshooting production, phải đối chiếu lịch/file thực tế của môi trường.
+
+### 3.4. Hai chế độ gửi
+
+| Chế độ | Trace source |
+|---|---|
+| Batch/CO file | `Services/VieFUNDIE/VieFUNDIE.cs` → `DLLs/UBFFImport/COrder.OrderFileGenerate` → `UBOrderCreateFile`/`UBOrderFileUpdateStatus` |
+| Realtime/IBM MQ | `Services/VieFUNDMQ/Order.cs` → `UBOrderGetMSG`; `VieFUNDMQ.SendMsg` put XML; `Order.UpdateOrderSet` → `UBOrderSetMsgStatus` |
+
+Source realtime có trong repository. Việc service/binary nào được cài, queue configuration, acknowledgement và retry policy ở production vẫn cần deployment/runtime evidence.
+
+## 4. UI tạo giao dịch
+
+### 4.1. Tabs
+
+`PopupTradeAdd.aspx` khai báo Buy, Sell, Switch, Transfer, ICT và Risk tabs. Risk là tab hỗ trợ, không phải transaction type độc lập.
+
+### 4.2. `Page_Load`
+
+`CBase.IsPageValid(...)` chạy trước `if (!IsPostBack)`, nên không đúng khi nói toàn bộ flow chỉ chạy lần đầu. Nhánh first-load thực hiện, theo các branch xen kẽ:
+
+1. đọc DSID/client và đóng page sớm nếu context không hợp lệ;
+2. load title và trade combo;
+3. load dealership/config;
+4. load client header/address, plan/account/bank/pending lists;
+5. cấu hình realtime, basket-only, access và trading-disabled;
+6. áp customization theo DSID và FundServ version/date branch.
+
+Không nên dùng số dòng hoặc thứ tự rút gọn như một contract vì hai source tree có line offset khác nhau.
+
+### 4.3. DSID customization đã quan sát
+
+| DSID | Behavior trong branch đã trace |
+|---|---|
+| `1911`, `2262` | Khóa/điều chỉnh ETF price type/time-in-force; `1911` còn force Gross ở một số Buy path. |
+| `1256` | Active code ẩn SIN/DOB trên receipt, remove settlement item `2`/`4`; block checkbox cũ là comment/dead code. |
+| `1623` | Ẩn Fund Fact requirement ở UI branch. |
+| `1853`, `2301`, `2501` | Form/confirmation customization; phải giữ đủ cả ba literal khi mô tả branch. |
+| `1274`, `1001` | Extra fee/options trong các branch tương ứng. |
+| `1912` | Trust branch chọn settlement source `I`; comment cũ nói dealer-settled không phản ánh active assignment. |
+
+Đây là behavior tại call-site, không phải định nghĩa dealer lấy từ DB config.
+
+## 5. Error correction
+
+### 5.1. Query action và thực thi action
+
+```text
+CTrx.AllowableAction
+  → UBFundTrxOrderCANCAX
+  → trả iCanDelete, iCanCAN, iCanCAX, iCanREV, iCanCHG, iCanUndo,
+    iReasonID, iOrderStatus, WONumber
+
+CTrx.TrxOrderCANCAX
+  → UBFundTrxCancel
+  → thực thi CAN/CAX/REV theo iOptions
+```
+
+C# đặt biến `iCanDEL`, nhưng result column của SP là `iCanDelete`. Hai SP có tên gần giống nhưng không cùng nhiệm vụ.
+
+Wrapper hiện ghi CAN áp cho Accepted và CAX áp cho Accepted hoặc Contracted. Vì vậy không hard-code “CAX chỉ Contracted chưa settle” ở UI; availability phải lấy từ `AllowableAction` và rule DB của môi trường.
+
+### 5.2. Narrative nghiệp vụ
+
+- REV: reversal của trade hợp lệ; source có `iOptions=2` và tạo reversal order.
+- AOT: as-of/back-dated order; source có date/original-order validation và XML fields.
+- Dilution: business amount liên quan AOT/REV/CAX, nhưng xem lỗi forwarding ở mục 6.2 trước khi giả định giá trị đã được persist.
+
+## 6. Parameter contract
+
+### 6.1. Nhóm parameter chính của Buy
+
+| Nhóm | Ví dụ |
+|---|---|
+| Core | `iClientID`, `iPlanID`, `iPositionID`, `fAmount`, `AmtType` |
+| Settlement | `SettlementInd`, `SettlementStatus`, `SettlementSource`, `SettlementMethod` |
+| Compliance | `bTrxLeveraged`, `bPEFP`, `bUnsolicited`, `bForceApproved`, `bForceRisk` |
+| AOT | `bAOT`, `AOTDateStr`, `bAOTOrginalOrder` |
+| Trust/payment | `bTrust`, `iTrustID`, PMT/bank/cheque fields |
+| ETF | `ETFOrderType`, `ETFTimeInForce`, `ETFExpiryDate`, price limit/stop |
+
+`CTrx.Buy` bind các nhóm trên vào `UBFundTrxBuy`, ngoại trừ caveat bên dưới. Parameter presence chỉ chứng minh C#/SP contract, không chứng minh column schema.
+
+### 6.2. `AOTDilution` đang bị drop
+
+UI truyền `AOTDilution` vào `CTrx.Buy/Sell/Switch`; method signatures nhận value nhưng implementation không `AddParam` value này vào SP. Transfer handler còn tính value nhưng `CTrx.Transfer` không có parameter tương ứng. Đây là defect candidate, không được mô tả như persistence đã xác minh.
+
+### 6.3. Switch/Transfer
+
+- Switch có source/destination position, `TaxEventInd`, `iForceOpt`; comment hiện mô tả option DSC→FEL và currency switch.
+- Transfer có `iMethod` và thông tin dealer/account/fund/SIN/plan/intermediary phía nguồn. Các nhánh SQL dùng nhiều `iType`; không gán một label chung cho tất cả.
+
+## 7. ETF/stock và FIX
+
+### 7.1. Hai create path khác nhau
+
+1. Buy/Sell ETF trong `PopupTradeAdd` vẫn gọi `CTrx.Buy/Sell`; khi network `4`, UI truyền order type, time-in-force, expiry, price limit/stop và queue step route sang BBS/FIX.
+2. `PanelStockOrder` gọi `CTrx.StockOrderAdd` → `UBStockOrderAdd` cho standalone stock-order UI.
+
+`Services/VieFUNDQFix/` chứng minh FIX service path tồn tại trong source. Deployment cụ thể vẫn cần kiểm tra môi trường.
+
+### 7.2. Lookup và validation
+
+SQL query `UB_Def_StockSide`, `UB_Def_StockOrderType`, `UB_Def_StockTimeInForce`; repository không có DDL/seed nên không thể chứng minh authoritative ID/label production. UI hiện xử lý order-type values `1..4`, price-limit/stop requirements và expiry khi time-in-force `6`, nhưng allowed set còn phụ thuộc lookup/config.
+
+Các mô tả “dealer chỉ dùng Market/Limit/Stop/Stop-Limit” hoặc “chỉ Day/GTC/GTD” phải được coi là convention vận hành cho đến khi đối chiếu lookup production.
+
+### 7.3. ETF transfer
+
+Các rule về last-business-date, tax impact và two-sided transfer nằm trong business narrative/feature UI. Chỉ gọi chúng là code-enforced sau khi trace `PanelETFTransferEdit`, feature flag `TMPiETFTransfer` và SP tương ứng ở version đang deploy.
+
+## 8. Pending orders và enqueue
+
+### 8.1. UI routing
+
+`PopupOrderBatch` chọn wrapper theo network:
+
+- network `2` → `OrderPending2Confirm`;
+- network `4` → `OrderPendingMove2BBS`;
+- còn lại → `OrderPendingMove2Waiting`.
+
+Do đó không quy mọi special route cho `UBOrderWaiting2SendAddInternal`.
+
+### 8.2. Wrapper/SP
+
+| Method | SP | Vai trò |
+|---|---|---|
+| `GetPendingOrderList` | `UBTrxPendingOrderList` | Pending transaction list. |
+| `GetOrderPendingSet` | `UBOrderPendingList` | Pending order set. |
+| `OrderPendingMove2Waiting` | `UBOrderWaiting2SendAdd` | Normal FundServ enqueue. |
+| `OrderPending2Confirm` | `UBOrderSetConfirmTaggedItems` | Confirm path; permission/config-dependent, không mặc định “admin”. |
+| `OrderPendingMove2BBS` | `UBOrderWaiting2BBSOrder` | BBS/network-4 path. |
+| `TrxOrderDelete` | `UBTrxOrderRemove` | Xóa order. |
+| `TrxDeleteOrUndo*` | `UBTrxDeleteOrUndo` | Toggle valid/deleted. |
+
+### 8.3. Gate của single-order normal enqueue
+
+WebForms route gọi `CTrx.OrderPendingMove2Waiting`, nhưng wrapper này không bind/expose `bForced`; vì vậy SP dùng default `0`. Trên UI/CTrx default path, thứ tự gate là:
+
+1. `IsFundFactOKOrder`.
+2. `IsOrderOK4FS`.
+3. `UBOrderCreateMSGXML(..., iOptions=2)` XML preflight.
+4. `IsOrderOK4Cash` trong `UBOrderWaiting2SendAddOne` trước insert.
+
+Direct/internal SP semantics khác default path: `bForced=1` bỏ qua cả `IsFundFactOKOrder` và các kết quả `IsOrderOK4FS` code `2..5`, nhưng code `6` (insufficient settled cash) vẫn chặn. `IsOrderOK4Cash` vẫn áp dụng cho normal queue type. Condition hiện cũng không chặn code `0`; bulk selection lại lọc `IsOrderOK4FS(...)=1`, nên default single, forced internal và bulk path không tương đương.
+
+`CTrx.OrderPendingMove2Waiting` truyền `bNewSourceID`, nhưng wrapper SQL `UBOrderWaiting2SendAdd` gọi internal bằng literal `0`; flag hiện không có hiệu lực qua path này. Insert queue còn có `TRY/CATCH` nuốt lỗi trong `...AddOne`, trong khi caller vẫn có thể tăng count, nên count trả về không phải bằng chứng chắc chắn row đã enqueue.
+
+## 9. View, search và manual transaction
+
+- `CTrx.GetViewList` → `UBTrxViewSearch`, với filter client/plan/account/work-order/date/status/type/currency và paging/sort.
+- `TrxView.aspx` là WebForms view; không có SQL `VIEW` cùng tên được chứng minh.
+- `PopupPlanTrx.aspx.cs` tự ghi `// This file is not in use`; không liệt kê như page active nếu chưa có runtime/navigation evidence.
+- `CTrx.ManualUpdate` chọn `UBFundTrxManualAdd` hoặc `UBFundTrxManualUpdate` theo `iTrxID`; `UBFundTrxManualCalc` tính trước. Page dùng account-add permission, không chứng minh “admin only”.
+
+Không dùng file size làm identifier vì generated output/copy source thay đổi theo branch.
+
+## 10. Database behavior và transaction boundary
+
+### 10.1. SP inventory lõi
+
+- Create/edit: `UBFundTrxBuy*`, `Sell*`, `Switch*`, `Transfer*`, `ICT*`, manual variants.
+- Pending/action: `UBTrxPendingOrderList`, `UBOrderPendingList`, `UBFundTrxOrderCANCAX`, `UBFundTrxCancel`, queue wrappers.
+- Send: `UBOrderCreateFile`, `UBOrderCreateMSGXML`, `UBOrderFileUpdateStatus`, `UBOrderGetMSG`, `UBOrderSetMsgStatus`.
+- Response/CAT: `UBXMLRecOrderRespnProcess*`, `UBXMLRecTrxRecordProcess*`.
+
+Không giữ con số “81 SP duy nhất” như invariant: repository có duplicate source và không pin commit/canonical file. Nếu cần inventory chính xác, generate từ đúng `Trx.cs` đang build.
+
+### 10.2. Atomicity và silent failure
+
+SQL snapshot cho thấy:
+
+- `UBFundTrxBuy` có `BEGIN/COMMIT TRAN` bị comment; Sell/Switch/Transfer không có outer transaction tương đương; ICT có explicit transaction.
+- Queue/send/response update nhiều table nhưng không có outer transaction end-to-end.
+- Nhiều validation/correlation query dùng `WITH (NOLOCK)`.
+- Một số `TRY/CATCH` hoặc C# import path nuốt lỗi/false-success.
+
+Vì vậy không được diễn đạt một multi-table “state transition” như atomic guarantee. Khi điều tra lỗi phải kiểm tra từng table và side effect.
+
+## 11. Settlement
+
+### 11.1. Source và indicator
+
+- `SettlementInd`: observed `G`/`N` = Gross/Net.
+- Buy UI có source `D`/`I`/`F`; Sell UI chỉ có `D`/`I`.
+- `SettlementMethod=1` được các SQL rule dùng như N$M.
+
+### 11.2. Dropdown runtime data
+
+`CBase.DisplaySettlementMethodDropDownList` gọi `UBTrxSettleMethodListByPlanID`, bind `FSCode`/description. UI luôn remove values `6`, `7`; DSID `1256` còn remove `2`, `4`.
+
+Repository không có lookup seed, nên tên của values `2..7` không được coi là DB-verified chỉ từ comment/vị trí dropdown. Comment cũ gần đoạn remove cũng không khớp hoàn toàn active code.
+
+## 12. Pricing và lịch vận hành
+
+Mutual-fund NAV sau market close, ETF market price, GIC daily rate, RS/Fundata/CANNEX và lịch T+1/T+2 là kiến thức vận hành hữu ích từ tài liệu nghiệp vụ cũ. Các timing này không được các method/SP audit ở trên cưỡng chế đầy đủ. Khi dùng cho support/SLA, cần xác nhận scheduler, integration config và file arrival của production.
+
+## 13. Cross-reference
+
+| Nội dung | Nguồn |
+|---|---|
+| Pipeline source-audit | [Order end-to-end](order-end-to-end.md) |
+| Namespace mã và defect | [Order Code Dictionary](code-dictionary.md) |
+| Settlement | [Settlement Guide](../settlement/README.md) |
+| Error correction narrative | `Docs_V2/business-logic-topics/error-correction.md` |
+| ETF transfer narrative | `Docs_V2/business-logic-topics/etf-transfer.md` |
+| SQL definitions được audit | `MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_3_CreateUDF.sql`, `000_4_CreateSP.sql` |
+
+`Docs_V2/Database/Table_Description.md` là tài liệu tham khảo, không thay thế base DDL/seed khi xác minh schema production.

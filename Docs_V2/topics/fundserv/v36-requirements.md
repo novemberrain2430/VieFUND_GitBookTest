@@ -1,3 +1,10 @@
+> [!CAUTION]
+> **Đây là bản text extract không đầy đủ, không phải toàn bộ Fundserv Standards V36.** Phần trích hiện có bên dưới được giữ nguyên và dừng ở nội dung tương ứng **trang 80/179**; phần còn lại của tài liệu gốc không có trong file này.
+>
+> Extract còn chứa **mojibake/lỗi encoding** (ví dụ `â€“`, `â€œ`). Các image reference đã được nối tới `Docs_V2/images`, nhưng chúng không khôi phục phần text bị thiếu. Không dùng file này làm source of truth đầy đủ hoặc làm bằng chứng implementation/deployment.
+>
+> Khi đánh giá tuân thủ, phải đối chiếu bộ tài liệu/XSD V36 đầy đủ do Fundserv phát hành và [V36 Compliance Matrix — trang canonical](v36-compliance-matrix.md).
+
 Fundserv Standards V36  REQUIREMENTS  
 
 *October 07, 2025*   
@@ -2025,30 +2032,30 @@ Customer Use Only October 7, 2025 79 of 179
 
 Customer Use Only October 7, 2025 80 of 179
 
-[image1]: ../images/v36-requirements_image1.png
+[image1]: ../../images/v36-requirements_image1.png
 
-[image2]: ../images/v36-requirements_image2.png
+[image2]: ../../images/v36-requirements_image2.png
 
-[image3]: ../images/v36-requirements_image3.png
+[image3]: ../../images/v36-requirements_image3.png
 
-[image4]: ../images/v36-requirements_image4.png
+[image4]: ../../images/v36-requirements_image4.png
 
-[image5]: ../images/v36-requirements_image5.png
+[image5]: ../../images/v36-requirements_image5.png
 
-[image6]: ../images/v36-requirements_image6.png
+[image6]: ../../images/v36-requirements_image6.png
 
-[image7]: ../images/v36-requirements_image7.png
+[image7]: ../../images/v36-requirements_image7.png
 
-[image8]: ../images/v36-requirements_image8.png
+[image8]: ../../images/v36-requirements_image8.png
 
-[image9]: ../images/v36-requirements_image9.png
+[image9]: ../../images/v36-requirements_image9.png
 
-[image10]: ../images/v36-requirements_image10.png
+[image10]: ../../images/v36-requirements_image10.png
 
-[image11]: ../images/v36-requirements_image11.png
+[image11]: ../../images/v36-requirements_image11.png
 
-[image12]: ../images/v36-requirements_image12.png
+[image12]: ../../images/v36-requirements_image12.png
 
-[image13]: ../images/v36-requirements_image13.png
+[image13]: ../../images/v36-requirements_image13.png
 
-[image14]: ../images/v36-requirements_image14.png
+[image14]: ../../images/v36-requirements_image14.png

@@ -1,315 +1,205 @@
-# TFS/NFU → FundServ: Current Sending Mechanism
+# Luồng runtime TFS/NFU
 
-## TL;DR
+Đây là trang canonical cho cơ chế gửi/nhận TFS và NFU. Bản chỉ có diagram: [TFS/NFU flow chart](tfs-nfu-flow-chart.md). Nhãn bằng chứng theo [README](README.md).
 
-Hệ thống gửi TFS/NFU tới FundServ qua pipeline **3 tầng**:
+## 1. Flow matrix
 
-1. **WebApp** (`PopupOrderBatch.aspx.cs`): User tag orders/NFU items → click "Generate" → chuyển status sang "Waiting" trong DB
-2. **VieFUNDIE Windows Service** (chạy nền, poll mỗi ~60s): Gọi stored procedure lấy XML body từ DB → wrap trong envelope TFS (`<OrdSet>`) hoặc NFU (`<MessageSet>`) → ghi file `.xml` ra thư mục `FF\OUT\`
-3. **FundServ Gateway** (IBM MQ hoặc SFTP): Pick up file từ thư mục OUT → truyền tới mạng FundServ
+| Flow | Runtime path | Boundary |
+|---|---|---|
+| TFS batch request | DB → `VieFUNDIE` → `COrder` → file `OrdSet` | Filesystem OUT → external gateway. |
+| TFS real-time request | DB → `VieFUNDMQ` → `MQMessage` | IBM MQ trực tiếp. |
+| TFS real-time response | IBM MQ response queue → `VieFUNDMQ` → `SaveMSGResponse`/`COrder.ImportXMLResp` → SP | Không qua filesystem, `FFImport` hay file archive. |
+| NFU batch request | DB → `VieFUNDIE` → `CXM` → file `MessageSet` | Filesystem OUT → external gateway. |
+| TFS/NFU batch response | External drop → filesystem IN → `FFImport` → `COrder`/`CXM` → SP | Final DB mutation phụ thuộc SP. |
 
-**WebApp không kết nối trực tiếp tới FundServ.** Toàn bộ giao tiếp qua file XML trên file system.
+TFS batch và TFS real-time là hai pipeline song song qua DB, không phải chuỗi “file rồi MQ”. Source MQ không mở file OUT; response real-time cũng được đọc trực tiếp từ queue thay vì qua `FFImport`. Source đã kiểm tra không có NFU MQ sender.
 
-### Luồng TFS (Transaction Orders)
-```
-User → PopupOrderBatch → CTrx.OrderPendingMove2Waiting() → DB
-→ VieFUNDIE.OnTimer() → COrder.OrderFileGenerate() → SP UBOrderCreateFile
-→ COrder.OrderFileCreate() → FF\OUT\*.xml → FundServ Gateway
-← DR response file → COrder.ImportXML() → SP UBXMLRecOrderRespnProcess → DB
-```
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:745-797`
+>
+> Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:997-1193`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:20-34`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:37-147`
 
-### Luồng NFU (Non-Financial Updates)
-```
-User → PopupOrderBatch (tab NFU) → CNFU.PendingMove2Waiting() → DB
-→ VieFUNDIE.OnTimer() → CXM.FileGenerate() → SP UBNFUCreateFile
-→ CXM.NFUFileCreate() → FF\OUT\*.xml → FundServ Gateway
-← XR response file → CXM.ImportXML() → SP UBXMLRecNFURespnProcess → DB
-```
+## 2. WebApp → DB boundary
 
-### V36 Gaps cần xử lý
-- `CDedns` class (`TS_Export.cs`) **thiếu** 4 fields: `EarlyRdmtnFee`, `DlrAdvsrFee`, `MVA`, `IRSTax`
-- `CTFSASucsr` cần **đổi tên** → `Sucsr` (mở rộng scope TFSA → TFSA+RRIF+FHSA)
-- `COrder.GetFSVersion()` cần thêm **cutoff date** cho V36 (June 15, 2026)
-- Schema version cần tăng từ `35` → `36`
+### TFS order
 
----
+`PopupOrderBatch` truyền `iMode=0` cho batch hoặc `iMode=1` cho real-time vào `CTrx.OrderPendingMove2Waiting`. Call-site chỉ chứng minh mode đi vào business/DB layer; row/status transition cuối là **DB/SP-dependent**.
 
-## Architecture Overview
+### NFU
 
-```mermaid
-flowchart TD
-    subgraph WebApp ["WebApp (ASP.NET)"]
-        A["PopupOrderBatch.aspx.cs"]
-        B["PopupPlanAdd.aspx.cs / PopupAccountAdd.aspx.cs"]
-        N1["CNFU.AddNFU()"]
-        N2["CNFU.PendingMove2Waiting()"]
-        T1["CTrx.OrderPendingMove2Waiting()"]
-    end
+UI gọi `CNFU.PendingMove2Waiting`; batch service sau đó dùng `CXM.FileGenerate`. Không suy diễn NFU-over-MQ khi không có sender call path tương ứng.
 
-    subgraph Database ["SQL Server"]
-        SP1["UBOrderCreateFile SP"]
-        SP2["UBNFUCreateFile SP"]
-        SP3["UBOrderFileUpdateStatus SP"]
-    end
+> Source evidence: `WebApp/Main/PopupOrderBatch.aspx.cs:320-377`
+>
+> Source evidence: `WebApp/Main/PopupOrderBatch.aspx.cs:864-903`
 
-    subgraph VieFUNDIE ["VieFUNDIE (Windows Service)"]
-        TIMER["OnTimer() - every 60s"]
-        OFG["COrder.OrderFileGenerate()"]
-        XFG["CXM.FileGenerate()"]
-    end
+## 3. TFS batch filesystem
 
-    subgraph FileSystem ["File System"]
-        OUT["m_FileUploadPath\n(FF\OUT folder)"]
-    end
-
-    subgraph FundServ ["FundServ Network"]
-        MQ["IBM MQ / SFTP Gateway"]
-    end
-
-    A -->|"User clicks Generate Order"| T1
-    T1 -->|"Move tagged orders → status='Waiting'"| SP1
-    A -->|"User clicks Generate NFU"| N2
-    N2 -->|"Move tagged NFUs → status='Waiting'"| SP2
-
-    TIMER -->|"Polls DB"| OFG
-    TIMER -->|"Polls DB"| XFG
-
-    OFG -->|"Calls SP"| SP1
-    SP1 -->|"Returns FileName + OrderMSG XML"| OFG
-    OFG -->|"OrderFileCreate()"| OUT
-
-    XFG -->|"Calls SP"| SP2
-    SP2 -->|"Returns FileName + MSG XML"| XFG
-    XFG -->|"NFUFileCreate()"| OUT
-
-    OFG -->|"On success"| SP3
-
-    OUT -->|"Picked up by FundServ Gateway\n(MQ or SFTP)"| MQ
-```
-
----
-
-## TFS (Transaction File System) — Order Sending Flow
-
-### Step 1: User Tags & Triggers Send (WebApp)
-
-**File**: `WebApp/Main/PopupOrderBatch.aspx.cs`
-
-1. User opens **Order Entry** page (tab "Pending")
-2. Tags orders using checkboxes → calls `CTrx.OrderPendingSelectionUpdate()`
-3. Clicks **"Generate Order"** button → `OnGenerateOrderFile()` (L295)
-4. Confirm dialog: *"Send tagged items to FundServ. Are you sure?"*
-5. On confirm → `OnGenerateOrderFileBtn()` (L320)
-6. Calls `CTrx.OrderPendingMove2Waiting()` — moves tagged orders to **"Waiting"** status in DB
-
-Two modes available:
-- **Real-time (RT)**: `iMode=1` → sent immediately via MQ
-- **Batch**: `iMode=0` → generates CO file for pickup
-
-### Step 2: VieFUNDIE Windows Service Generates File
-
-**File**: `VieFUNDIE/VieFUNDIE.cs` → `OnTimer()` (L654)
-
-Every ~60 seconds, the service:
-1. Calls `COrder.OrderFileGenerate()` (L754)
-2. Then calls `CXM.FileGenerate()` (L758) for NFU
-
-### Step 3: TFS XML File Generation
-
-**File**: `UBFFImport/COrder.cs`
-
-`OrderFileGenerate()` (L86):
-1. Calls SP `UBOrderCreateFile` — returns `FileName`, `OrderMSG` (XML body), `iVersion`, `bLTI`
-2. The SP assembles XML from order data in DB using classes from `UBExport/TS_Export.cs`
-3. Calls `OrderFileCreate()` (L50) which wraps the body in TFS envelope:
+1. Trong timer cycle hợp lệ, `VieFUNDIE` gọi `COrder.OrderFileGenerate`.
+2. `COrder` gọi `UBOrderCreateFile` và đọc `FileName`, `OrderMSG`, `iVersion`, `iFileID`, `bLTI` cùng flags liên quan.
+3. C# normalize version, tạo UTF-8 `OrdSet` envelope và ghi file dưới configured upload path với filename do SP trả về.
+4. Sau write, C# gọi `UBOrderFileUpdateStatus`; mutation chính xác của SP chưa được chứng minh.
+5. Source-visible flow dừng ở filesystem OUT; external gateway chịu trách nhiệm pickup.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<OrdSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-        xmlns="tfs" xsi:schemaLocation="tfs tfs.xsd" Version="35">
-  <!-- OrderMSG body from SP -->
+<OrdSet xmlns="tfs" Version="35|36">
+  <!-- OrderMSG: DB/SP-dependent -->
 </OrdSet>
 ```
 
-4. Writes file to `m_FileUploadPath` (e.g., `C:\VieFUND\FF\OUT\`)
-5. On success → calls SP `UBOrderFileUpdateStatus` to mark `iStatus=1`
+Filename, body, order selection và final status là **DB/SP-dependent**. Repository không chứa FTP/SFTP client implementation cho hop batch; không gán transport, actor, schedule hay ACK cho `VieFUNDIE`.
 
-### Step 4: Version Control
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:745-758`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:20-84`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:86-166`
 
-**File**: `UBFFImport/COrder.cs` → `GetFSVersion()` (L20)
+## 4. TFS real-time qua IBM MQ
 
-```csharp
-static public int GetFSVersion(int iVersion)
-{
-    if (iVersion < 34) iVersion = 34;
-    if (iVersion <= 34)
-    {
-        DateTime dtToday = DateTime.Now;
-        DateTime dtCutOff = new DateTime(2025, 9, 6);
-        iVersion = 34;
-        if (dtToday >= dtCutOff) iVersion = 35;
-    }
-    return iVersion;
-}
-```
+`VieFUNDMQ` là service độc lập, xử lý cả hai chiều mà không dùng batch filesystem.
 
-> [!IMPORTANT]
-> Currently hardcoded to switch from V34 → V35 based on date `2025-09-06`. **V36 is not yet implemented here**. This will need a new cutoff for the V36 go-live date (June 15, 2026).
+**Request:**
 
----
+1. Provider gọi `UBOrderGetMSG` với `iMode=1` và lấy `OrderMSG` từ DB.
+2. Service tạo order envelope/`MQMessage`, rồi `Put` trực tiếp vào send queue.
+3. Service gọi status SP theo kết quả send; final row/status mutation vẫn **DB/SP-dependent**.
 
-## NFU (Non-Financial Update) — Sending Flow
+**Response:**
 
-### Step 1: User Tags & Triggers Send (WebApp)
+1. `GetMsgData` đọc trực tiếp response queue bằng `MQQueue.Get`.
+2. `ProcessResponseMsg` gọi `SaveMSGResponse`, tạo XML reader và chuyển message vào `COrder.ImportXMLResp`.
+3. Các call này đi tới DB/SP boundary; final mutation không suy diễn từ tên method/SP.
 
-**File**: `WebApp/Main/PopupOrderBatch.aspx.cs` — Tab "NFU"
+Không bước nào đọc file do `COrder.OrderFileGenerate` tạo. MQ response không qua filesystem IN, `FFImport` discovery hay file archive.
 
-1. User opens **Order Entry** page, tab "NFU" (index 2)
-2. Selects NFU types to send (checkboxes):
-   - Client Name, Client Address, New Account, Beneficiary, Account Attributes
-   - Distribution Options, Pre-Auth Chequing, Advisor Info, Advisor Deactivate
-   - Transfer to Advisor, TFSA Successor, FATCA, Fee, CDIC
-3. Tags items → `CNFU.PendingSelectionUpdate()`
-4. Clicks **"Generate NFU"** → `OnGenerateNFUFile()` (L873)
-5. Calls `CNFU.PendingMove2Waiting()` — moves tagged items to "Waiting" status
+> Source evidence: `Services/VieFUNDMQ/Order.cs:20-34`
+>
+> Source evidence: `Services/VieFUNDMQ/Order.cs:37-139`
+>
+> Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:997-1193`
+>
+> Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:1420-1442`
+>
+> Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:1479-1498`
 
-### Step 2: VieFUNDIE Windows Service Generates File
+## 5. NFU batch filesystem
 
-Same as TFS — `OnTimer()` calls `CXM.FileGenerate()` right after `COrder.OrderFileGenerate()`.
-
-### Step 3: NFU XML File Generation
-
-**File**: `UBFFImport/CXM.cs`
-
-`FileGenerate()` (L77):
-1. Calls SP `UBNFUCreateFile` — returns `FileName`, `MSG` (XML body), `iVersion`, `iFileID`
-2. Calls `NFUFileCreate()` (L36) which wraps the body in NFU envelope:
+1. `VieFUNDIE` gọi `CXM.FileGenerate`.
+2. `UBNFUCreateFile` trả `FileName`, `MSG`, `iVersion`, `iFileID`.
+3. C# áp dụng version rule inline, tạo UTF-8 `MessageSet` envelope và ghi file dưới configured upload path.
+4. File dừng ở external pickup boundary giống batch filesystem; không gán MQ/FTP/SFTP nếu thiếu deployment evidence.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<MessageSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-            xmlns="nfu" xsi:schemaLocation="nfu nfu.xsd" Version="35">
-  <!-- MSG body from SP -->
+<MessageSet xmlns="nfu" Version="35|36">
+  <!-- MSG: DB/SP-dependent -->
 </MessageSet>
 ```
 
-3. Writes file to `m_FileUploadPath`
+Filename, body và NFU row selection là **DB/SP-dependent**. Trong method đã đọc không có post-write status SP riêng; không copy hành vi status của TFS sang NFU.
 
-### NFU Data Sources
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:754-762`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:36-75`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:77-128`
 
-NFU messages originate from various UI pages:
-- `WebApp/Main/PopupPlanAdd.aspx.cs` — Account Setup (New Account, Successor, etc.)
-- `WebApp/Main/PopupAccountAdd.aspx.cs` — Account modifications
-- `WebApp/Main/PanelTFSAEdit.aspx.cs` — TFSA Successor edits
-- `WebApp/Main/PanelPlanBenAdd.aspx.cs` — Beneficiary updates
+## 6. Encoding, version và runtime settings
 
-These pages call `CNFU.AddNFU()` (`UBClasses/NFU.cs` L458) which calls SP `UBNFUAdd` to queue the NFU message.
+### Encoding/version outbound
 
----
+TFS `OrdSet` và NFU `MessageSet` đều khai báo UTF-8 và dùng UTF-8 writer. DB setting `FILE_ENCODING` không được truyền vào hai writer này.
 
-## File Delivery to FundServ
+Output version luôn `>=35`:
 
-### Output Path
+```text
+input <= 35, trước 2026-06-13 00:00:00 local time -> 35
+input <= 35, từ    2026-06-13 00:00:00 local time -> 36
+input >  35                                           -> giữ nguyên
+```
 
-Files are written to the **Upload Path** (configurable per dealership):
-- Default: `<AppPath>\FF\OUT\`
-- Configurable via WebApp: `PopupFundServ.aspx.cs` → `idFundServUploadPath`
+TFS dùng `COrder.GetFSVersion`; NFU áp dụng cùng rule inline trong `CXM.NFUFileCreate`. Cutover chỉ xác nhận envelope version, không tự xác nhận các DOT/parser/business changes V36.
 
-### Transport Mechanism
+> Source evidence: `DLLs/UBFFImport/COrder.cs:20-84`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:36-75`
 
-Files in the output directory are picked up by the **FundServ Gateway** infrastructure:
-- **IBM MQ** (via `VieFUNDMQLib`) — for real-time dealers
-- **SFTP/File-based** — FundServ's standard file pickup mechanism
+### Settings ownership
 
-> [!NOTE]
-> The WebApp/VieFUNDIE **does not directly connect** to FundServ's network. It writes XML files to a shared directory. A separate FundServ-provided gateway (or IBM MQ middleware) handles actual network transmission.
+| Nguồn | Vai trò |
+|---|---|
+| DB `UBFSRuleList('Service')` | `FILE_PATH*`, upload/GIC path, inbound `FILE_ENCODING`, `NO_RUNTIME`, `NO_WRUNDAY`, `NO_MRUNDAY`, `TEST_RUN`. |
+| Registry | Chọn DBID và connection string. |
+| `App.config` | Chủ yếu `QUERYINTERVAL`; file hiện có `60000` ms. |
 
----
+`QUERYINTERVAL` là polling interval, không phải business schedule. Wrapper nhận `DSID` nhưng implementation thấy trong repository chỉ bind `TopicStr`; không khẳng định DB settings được lọc theo DSID nếu chưa kiểm tra SP production.
 
-## Response Handling (DR/XR files)
+> Source evidence: `Services/VieFUNDIE/App.config:3-8`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:243-271`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:299-325`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:352-610`
+>
+> Source evidence: `DLLs/UBConnection/CDatabase.cs:1906-1923`
+>
+> Source evidence: `DLLs/UBConnection/CRegistry.cs:69-125`
+>
+> Source evidence: `DLLs/UBConnection/CRegistry.cs:221-250`
 
-After FundServ processes the TFS/NFU, response files are deposited back:
+### Encoding inbound
 
-| File Type | Handler | SP |
+DB-backed `FILE_ENCODING` được truyền vào `FFImport.ProcessAllX`; default code dùng code page 1252 khi setting thiếu/không hợp lệ. Đây là parser setting cho inbound, không phải encoding của outbound `OrdSet`/`MessageSet`.
+
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:443-610`
+>
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:785-790`
+
+## 7. Inbound DR/XR responses
+
+1. External process drop response vào configured IN path.
+2. `FFImport` lấy DB file-code metadata, dùng generic `FileCode*`/`FileCodeTest*` và special patterns.
+3. C# dispatch physical order-response codes như `DR` vào `COrder.ImportXML`; `XR`/NFU response vào `CXM.ImportXML`.
+4. Handler gọi response SP và đọc `iImportStatus`.
+5. File được move/archive theo integration-specific branch; không có một archive invariant chung.
+
+| Physical flow | Handler | SP boundary |
 |---|---|---|
-| **DR** (Order Response) | `UBFFImport/COrder.cs` `ImportXML()` | `UBXMLRecOrderRespnProcess` |
-| **XR** (NFU Response) | `UBFFImport/CXM.cs` `ImportXML()` | `UBXMLRecNFURespnProcess` |
+| `DR` và order-response family | `COrder.ImportXML` | `UBXMLRecOrderRespnProcess` |
+| `XR`/NFU response | `CXM.ImportXML` | `UBXMLRecNFURespnProcess` |
 
-The VieFUNDIE service picks up response files from `m_FilePath` (the IN folder), parses them, and updates order/NFU status in the DB.
+Call-site không đủ để tuyên bố order được confirm/reject ra sao hoặc transaction, holding, NAV, status nào được tạo/cập nhật. Mọi final DB mutation là **DB/SP-dependent** nếu chưa có đúng production SP source/version.
 
----
+`DR` là physical order response. Distribution trong TS/HS là luồng CAT/transaction-reconciliation khác, không phải ý nghĩa của `DR`.
 
-## TFS XML Structure (Export)
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:721-760`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:904-1499`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:2166-2518`
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:713-824`
+>
+> Source evidence: `DLLs/UBFFImport/CXM.cs:575-644`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:2435-2472`
+>
+> Source evidence: `DLLs/UBFFImport/CAT.cs:1141-1175`
 
-**File**: `UBExport/TS_Export.cs`
+## 8. Ngoài phạm vi flow TFS/NFU
 
-Key XML serialization classes:
+Cannex GIC là integration riêng dùng chung service/timer `VieFUNDIE`, với GIC path, generator và inbound/archive branches riêng. Source không chứng minh Cannex đi qua Fundserv hay cùng external gateway TFS/NFU.
 
-```
-CTS_Export (root: TrxnRecon)
-├── CreateDate, MgmtCode, DlrCode
-└── TrxnRec[] (CTrxnRec)
-    ├── ProcessDate, FundAcctID, AcctDesig, DlrCode, RepCode, AcctType, OrdSrc, OrdType, SrcID
-    ├── BuyCof (Buy Confirmation)
-    │   ├── TrxnTyp, TrxnTypDtl, TradeDate, SettlDate
-    │   └── BuyFund (FundID, Currency, GrossAmt, NetAmt, NAV, UnitTrxnd, SettlMethd, SettlAmt)
-    ├── SellCof (Sell Confirmation)
-    │   └── SellFund (+ CDedns deductions)
-    ├── SwitchCof (Switch Out + In)
-    ├── DistribCof (Distribution)
-    │   └── DistribFund (+ CDedns)
-    └── ETCof (External Transfer)
-        ├── ToAcct / FromAcct
-        ├── TrnsfrFund (+ CDedns)
-        └── Demo (Owner, Jnt, Spousal, ITF, RESPBenDtl, DthBenDtl, TFSASucsr)
-```
+> Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:763-782`
+>
+> Source evidence: `DLLs/UBFFImport/CannexOrder.cs:536-618`
+>
+> Source evidence: `DLLs/UBFFImport/FFImport.cs:1123-1328`
 
-### Current Deductions (CDedns) fields:
-
-```csharp
-public class CDedns
-{
-    public string ShortTermFee;
-    public string AdminFee;
-    public string MgmtFee;
-    public string PerformFee;
-    public string OtherFee;          // ← Only specific deduction fee
-    public string Penalty;
-    public string DSCAmount;
-    public string SalesTax;
-    public string FedWHoldTax;
-    public string ProvWHoldTax;
-    public string LSIFClawbackFed;
-    public string LSIFClawbackProv;
-    public string Clawback;
-    public string TotalDedns;        // ← Required
-    // MISSING: EarlyRdmtnFee, DlrAdvsrFee, MVA, IRSTax
-}
-```
-
-> [!WARNING]
-> The 4 new V36 deduction fields (`EarlyRdmtnFee`, `DlrAdvsrFee`, `MVA`, `IRSTax`) are **completely absent** from the current `CDedns` class. These need to be added for V36 compliance.
-
-### Current Successor section:
-
-```csharp
-// In CDemo:
-public CTFSASucsr TFSASucsr;  // ← Named "TFSASucsr", V36 renames to "Sucsr"
-```
-
-> [!WARNING]
-> V36 requires renaming `TFSASucsr` → `Sucsr` in the XML output, and extending scope to RRIF (type=04) and FHSA (type=22). See implementation plan Section 5.
-
----
-
-## Summary: Key Files in TFS/NFU Send Pipeline
-
-| Stage | TFS Files | NFU Files |
-|---|---|---|
-| **UI (WebApp)** | `WebApp/Main/PopupOrderBatch.aspx.cs` | Same file, NFU tab |
-| **Business Logic** | `CTrx` class | `UBClasses/NFU.cs` (`CNFU`) |
-| **XML Serialization** | `UBExport/TS_Export.cs` | SP-generated (DB-side) |
-| **File Generation** | `UBFFImport/COrder.cs` | `UBFFImport/CXM.cs` |
-| **Windows Service** | `VieFUNDIE/VieFUNDIE.cs` | Same service |
-| **Schema version** | `tfs.xsd` Version="35" | `nfu.xsd` Version="35" |
-| **Response Import** | `UBFFImport/COrder.cs` `ImportXML()` → DR files | `UBFFImport/CXM.cs` `ImportXML()` → XR files |
+Identity/protocol của batch gateway, production SP parity và deployed binary parity cần evidence ngoài repository; không biến các khoảng trống này thành khẳng định.

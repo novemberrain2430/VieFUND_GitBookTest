@@ -1,14 +1,22 @@
 # Client Report PDF — Ad-hoc Generation
 
-> Trạng thái: **đã đối chiếu source/SP/DB snapshot ngày 2026-09-05**. Đây là pipeline “Run now” của màn hình Client Report, không phải toàn bộ hệ thống report scheduler.
+> Audit baseline: **2026-09-18**, source commit `06c586b78`. Pipeline này dùng source chuẩn [`DLLs/VieFUNDPdf`](../../../DLLs/VieFUNDPdf) và SQL artifact [`000_4_CreateSP.sql`](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql); **chưa xác minh DB live**. Đây là “Run now” của Client Report, không phải toàn bộ scheduler.
 
-## 1. Luồng thực tế
+## 1. Phạm vi và mức kiểm chứng
+
+- **[S] Source**: call site/branch/parameter có trong source chuẩn đang checkout.
+- **[A] Artifact DB**: procedure/UDF definition có trong SQL dump của repo.
+- **[L] Live DB**: deployed definition, synonym, permission, constraint và dữ liệu runtime chưa kiểm tra.
+
+Cây `MyPortfolioNew/.../libs/VieFUNDPdf` là build graph khác và đã drift: bản đó không có type `15`, còn source chuẩn `DLLs/VieFUNDPdf` có type `15`. Không dùng dispatch matrix của hai cây thay thế cho nhau.
+
+## 2. Luồng thực tế
 
 ```mermaid
 sequenceDiagram
     participant UI as PopupClientReportTypes
     participant DB as SQL Server/TMP
-    participant Worker as CReport background Thread
+    participant Worker as CReport raw Thread
     participant PDF as Report generator
 
     UI->>DB: UBReportRequestAddTMP
@@ -18,100 +26,133 @@ sequenceDiagram
     DB-->>Worker: ReportInfo + ClientList + Options
     loop từng client
         Worker->>PDF: dispatch theo iReportType
-        PDF-->>Worker: byte[] PDF
+        PDF-->>Worker: byte[] hoặc null
     end
-    Worker->>DB: UBReportPdfObjTMPAdd
+    alt MainPdfObj != null
+        Worker->>DB: UBReportPdfObjTMPAdd
+    else MainPdfObj == null
+        Worker-->>Worker: Không gọi save SP; iRet giữ 1
+    end
     Worker->>DB: UBReportRequestTMPEnd
     Worker-->>UI: FinishCallback(iRet)
 ```
 
-Entry point UI là [`PopupClientReportTypes.aspx.cs`](../../../WebApp/Main/PopupClientReportTypes.aspx.cs#L1219). UI xây `KeyIDStr/KeyValueStr`, gọi `CReport.AddRequestTMP`, rồi:
+Entry point là [`PopupClientReportTypes.aspx.cs`](../../../WebApp/Main/PopupClientReportTypes.aspx.cs). UI serialize `KeyIDStr/KeyValueStr`, gọi `CReport.AddRequestTMP`, rồi:
 
-- `iRunMode=0`: tạo `CReport`, khởi động thread trong web process và giữ handler trong Session;
-- `iRunMode>0`: chỉ báo request đã gửi cho service. Nhánh scheduled/service dùng request bền (`UB_ReportRequest`) và nằm ngoài pipeline TMP mô tả ở đây.
+- `iRunMode=0`: giá trị đang được hard-code trong handler; tạo `CReport`, mở raw `Thread` trong web process và giữ handler trong Session [S];
+- `iRunMode>0`: branch hiện không reachable trong checkout vì không có assignment khác. Nếu branch được bật lại, handler sẽ hiển thị request đã gửi service và return, **nhưng `AddRequestTMP` đã chạy trước đó** [S]. Caller này không chứng minh request được chuyển sang `UB_ReportRequest`; muốn mô tả scheduled flow phải trace screen/service creator riêng.
 
-## 2. Request và data contract
+Diagram là happy path. Trong worker hiện tại, exception có thể nhảy vào error callback trước `UBReportRequestTMPEnd`; cleanup không được bảo đảm cho mọi path [S].
 
-### 2.1. Tạo request
+## 3. Request và database contract
 
-`CReport.AddRequestTMP()` gọi `UBReportRequestAddTMP` ([source](../../../VieFUNDPdf/CReport.cs#L6590)). SP:
+### 3.1. Tạo request
 
-- lấy tập rep user được truy cập qua `UBMemberRepAccessList` hoặc danh sách rep chỉ định;
-- dựng client list từ một client, search list, favorite list hoặc toàn bộ client của rep;
-- lưu request/options/client list vào các bảng TMP;
-- trả `iRequestID`, hoặc `0` ở wrapper nếu `iRet>0`.
+[`CReport.AddRequestTMP`](../../../DLLs/VieFUNDPdf/CReport.cs) gọi `UBReportRequestAddTMP` với các parameter [S]/[A]:
 
-`UBReportAdd` **không** tạo request ad-hoc; đó là SP tính dữ liệu summary được `Customer.GetSummaryDataSet()` gọi. Tài liệu cũ đã nhầm hai vai trò này.
+- identity/report: `iUserID`, `iReportType`;
+- dates: `EffectiveDate`, `EffectiveDateFrom`, `TrxDateFrom`;
+- client scope: `iClientListOption`, `iClientID`, `RepIDStr`, `iPrimaryClientOnly`;
+- filters: `bIncludeReturnMail`, `bExcludeIntermediaryOnly`;
+- options: `KeyIDStr`, `KeyValueStr`.
 
-### 2.2. Đọc và consume request
+Wrapper đọc `iRequestID`, `iRet` và trả request ID `0` khi `iRet>0` [S]. SQL artifact xác nhận các rule [A]:
 
-`ClientReportAdhocHeaderSet()` gọi `UBReportRequestTMP` với `bRemove=true` ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L306)). SP trả ba result set có `RecType`:
+1. rep scope đến từ `UBRepCodeFromList` nếu có `RepIDStr`, nếu không từ `UBMemberRepAccessList`;
+2. client option `1` dùng search list, `2` dùng favorite list, `3` lấy toàn bộ client theo rep, còn lại dùng single client;
+3. primary-only đi trực tiếp qua `UB_Plan.iClientID`; nhánh còn lại dùng `UB_CustomerPlan`;
+4. account active hoặc terminated sau effective-from date được giữ;
+5. return-mail/intermediary filters có thể xóa client khỏi request;
+6. dates parse bằng UDF `UBDate`, option strings tách bằng `SplitStr`, thiếu `ShowRepName` thì insert default `1`;
+7. procedure ghi `UB_ReportRequestTMP`, `UB_ReportRequestClientTMP`, `UB_ReportRepListClientTMP`, `UB_ReportOptionTMP`.
 
-| Result set | Nội dung |
+`UBReportAdd` không tạo request ad-hoc; đó là summary SP được caller khác sử dụng.
+
+### 3.2. Đọc và consume request
+
+[`ClientReportAdhocHeaderSet`](../../../DLLs/VieFUNDPdf/ClientReportAdhoc.cs) gọi `UBReportRequestTMP(iUserID,iRequestID,bRemove=1)`. Artifact trả đúng ba result set [A]:
+
+| `RecType` | Selected columns/contract |
 |---|---|
-| `ReportInfo` | `iReportType`, status, user, effective/from/transaction-from dates. |
-| `ClientList` | Danh sách `iClientID`, sort theo tên. |
-| `Options` | Cặp `KeyID`/`KeyValue` do UI gửi. |
+| `ReportInfo` | `iRequestID`, `iReportType`, `iStatus`, `iUserID`, `EffectiveDate`, `EffectiveDateFrom`, `TrxDateFrom`; dates qua `DateStr(...,101)`. |
+| `ClientList` | request ID alias `ID`, `iClientID`; join customer và `ORDER BY LastName, FirstName, ID`. |
+| `Options` | `KeyID`, `KeyValue`. |
 
-Sau khi select, SP xóa request/client/options khi `bRemove=1`. Worker vẫn gọi `UBReportRequestTMPEnd` ở cuối để cleanup thêm `UB_ReportRepListClientTMP` và các dòng còn sót.
+Worker đổi `DataTable.TableName` bằng column `RecType`; đây là untyped/stringly-typed contract [S]. Empty result set bị đổi sang tên fallback và worker không guard mọi trường hợp trước `ReportInfo.Rows[0]`.
 
-## 3. Dispatch report type
+Khi `bRemove=1`, SP consume request/client/options. Worker gọi thêm `UBReportRequestTMPEnd` để cleanup request/client/rep/options TMP trên normal path.
 
-Các type sau có trong memory-mode switch ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L55)):
+### 3.3. Hai điểm DB phải kiểm tra live
 
-| Type | Generator được gọi | Data/SP tiêu biểu đã xác minh |
+1. Artifact `UBReportRequestTMP` nhận `iUserID`/`DSID`, nhưng các select request lọc bằng `iRequestID`, không có owner predicate theo user. Phải chứng minh request ID không đoán được và authorization được enforce ở caller/BLL/deployed SP [A]/[L].
+2. `UBReportRequestAddTMP`, `UBReportRequestTMP` và `UBReportRequestTMPEnd` trộn object local `dbo.UB_Report*TMP` với `VieFUNDTMP.dbo.UB_Report*TMP`. Repo không có DDL/synonym đủ để xác định chúng là cùng physical object [A]/[L].
+
+## 4. Dispatch report type
+
+Memory-mode switch của source chuẩn [`ClientReportAdhoc.cs`](../../../DLLs/VieFUNDPdf/ClientReportAdhoc.cs) có đúng các type sau [S]:
+
+| Type | Generator được gọi | Data/SP tiêu biểu |
 |---:|---|---|
 | `1` | `ClientAccountStatementPdfObj` | `UBReportClientAccountStatement` |
-| `2` | `ClientInvestorStatementPdfObj(..., false)` | Nhánh DataSet trong `CReport.cs`; có tên SP động theo option. |
+| `2` | `ClientInvestorStatementPdfObj(..., false)` | `UBReportClientInvestorStatement` hoặc `_PerCurrency` theo option. |
 | `3` | `ClientAssetMixPdfObj` | `UBReportClientAssetMix` |
 | `5` | `ClientAccountStatementPdfObj_XIRR` | `UBReportClientAccountStatement_XIRR` |
-| `6` | `ClientInvestorStatementPdfObj(..., true)` | Cùng family investor statement. |
+| `6` | `ClientInvestorStatementPdfObj(..., true)` | Cùng investor family. |
 | `7` | `ClientInvestorStatementPdfObj_XIRR` | `UBReportClientInvestorStatement_XIRR` |
 | `8` | `ClientAccountStatementPdfObj_CG` | `UBReportClientCapitalGainStatement` |
 | `9` | `ClientAccountStatementPdfObj_2015` | `UBReportClientAccountStatement_2015` |
 | `10` | `ClientAccountStatementPdfObj_DailyGraph` | `UBReportClientAccountStatementWithDailyGraph` |
-| `11` | `ClientCommission` | `UBReportClientCommission` |
-| `12` | `ClientInvestmentPerformance` | Report/performance dataset trong `CReport`. |
+| `11` | `ClientCommission` | `UBReportClientCommission` family |
+| `12` | `ClientInvestmentPerformance` | `UBReportClientPerformance` |
 | `13` | `AccountSummaryBySupplierPdfObj` | `UBReportClientAccountSummaryBySupplier` |
-| `14` | `ClientPortfolioPerformance` | Portfolio performance pipeline trong `CReport`/`ClientPerformance`. |
+| `14` | `ClientPortfolioPerformance` | `UBReportClientPortfolioPerformance` |
+| `15` | `ClientPortfolioPerformancePdfObj` | Portfolio-performance “U” path |
 | `50` | `ClientAccountStatementPdfObjTrxOnly` | `UBReportClientAccountStatementTrxOnly` |
-| `104` | `ClientHoldingPerformanceAndPortfolioSummary` | Ghép holding performance và portfolio summary. |
 
-Không thêm type mới chỉ ở UI: phải thêm cùng contract ở request definition, worker dispatch, generator, SP/data set và download/persistence.
+Không có case `104` hoặc symbol `ClientHoldingPerformanceAndPortfolioSummary` trong source chuẩn. Route WebApp `104` là risk assessment, không phải ad-hoc type.
 
-## 4. Memory mode và file mode
+Không thêm type chỉ ở UI: phải đồng bộ ID, request/options contract, worker dispatch, generator, SP/result set, persistence/download và cả hai execution mode.
 
-### 4.1. Memory mode (`<=5` client)
+## 5. Memory mode và file mode
 
-`CreatePdfObjClientReportAdhocMemory()` tạo `byte[]` từng client rồi merge bằng `PdfBuilder.Merge2PdfObjs`. Nó hỗ trợ đủ 15 report type trong bảng trên và kiểm tra `m_Abort` trước mỗi client.
+### 5.1. Memory mode (`<=5` client)
 
-### 4.2. File mode (`>5` client)
+`CreatePdfObjClientReportAdhocMemory` tạo `byte[]` từng client rồi merge bằng `PdfBuilder.Merge2PdfObjs`. Nó hỗ trợ đủ 15 type trong bảng trên và kiểm tra `m_Abort` trước mỗi client [S].
 
-`CreatePdfObjClientReportAdhocFile()` mở `PdfCopy`, add từng PDF vào file tạm, đóng document, đọc file lại thành `byte[]` và xóa file.
+### 5.2. File mode (`>5` client)
 
-Source hiện chỉ có case `1,2,3,5,6,7,8,9,10,13`. Type `11,12,14,50,104` rơi vào `default`, tạo `PdfObj=null`. Đây là khác biệt chức năng theo số lượng client, không phải chỉ là tối ưu bộ nhớ.
+`CreatePdfObjClientReportAdhocFile` mở `PdfCopy`, add từng PDF vào temp file, đóng document, đọc file lại thành `byte[]` rồi xóa file. Switch chỉ có `1,2,3,5,6,7,8,9,10,13` [S].
 
-## 5. Lưu output và trạng thái
+| Type thiếu | Hệ quả |
+|---|---|
+| `11,12,14,15,50` | Rơi `default`, `PdfObj=null`; output có thể thiếu client/nội dung hoặc không lưu được. |
 
-`CreatePdfObjClientReportAdhoc()` gọi `SavePdfObj2TMP(DBIDStr, TMPFILE_CLIENT, UserID, MainPdfObj)`. Wrapper này gọi `UBReportPdfObjTMPAdd`, insert/update `UB_ReportObjTMP` theo `(iUserID, iType)` ([SQL](../../../ScriptDB/000_4_CreateSP.sql#L564080)).
+Behavior thay đổi đúng tại client thứ **6**; đây là functional bug candidate, không chỉ là tối ưu memory.
 
-Hệ quả:
+## 6. Lưu output và callback
 
-- kết quả TMP là “slot mới nhất” theo user/type, không phải lịch sử bất biến theo request;
-- request khác của cùng user/type có thể overwrite output nếu chạy chồng nhau;
-- download phải giữ đúng user/type/session contract.
+Khi `MainPdfObj != null`, `CreatePdfObjClientReportAdhoc` gọi `SavePdfObj2TMP(DBIDStr,TMPFILE_CLIENT,UserID,MainPdfObj)`. Wrapper gọi `UBReportPdfObjTMPAdd(iType,iUserID,PdfObj,iOptions=0)` [S]/[A]. Khi `MainPdfObj == null`, worker hiện không gọi save SP, giữ `iRet=1`, nên slot cũ cũng không bị xóa qua path này. Contract trực tiếp của SP trong artifact là:
+
+- tìm `TOP 1` theo `(iUserID,iType)` mà không `ORDER BY`;
+- nếu đã có slot: `PdfObj` khác null thì update `ObjData`, còn null thì xóa slot;
+- nếu chưa có slot: nhánh `ELSE` vẫn insert row, kể cả khi `PdfObj` null;
+- không nhận request ID.
+
+Repo không có DDL của `UB_ReportObjTMP`, nên chưa chứng minh `(iUserID,iType)` có unique constraint [L]. Hệ quả: đây là “latest slot”, concurrent run có thể overwrite; nếu live DB có duplicate, `TOP 1` còn chọn không xác định.
 
 `iRet` callback:
 
-| Giá trị | Nghĩa ở worker |
+| Giá trị | Nghĩa trong normal worker flow |
 |---:|---|
-| `0` | Có PDF và lưu TMP trả ID > 0. |
+| `0` | Có PDF và save TMP trả ID > 0. |
 | `1` | Không tạo/lưu được output. |
 | `2` | Worker thấy `m_Abort`. |
 
-## 6. Option contract
+Exception đi error callback riêng, không được mô tả đầy đủ bởi ba giá trị trên.
 
-UI serialize option thành hai chuỗi key/value; SP chuyển lại thành bảng `Options`. Generator đọc option bằng helper `GetReportOption*`. Các key thường gặp:
+## 7. Option contract
+
+UI serialize option thành hai chuỗi; SP trả bảng `Options`; generator đọc bằng `GetReportOption*`. Các key thường gặp:
 
 - dữ liệu: `IncludeGIC`, `IncludeCash`, `IncludeStock`, `ShowTrx`, `TrxCapGain`;
 - layout: `ShowBVAccount`, `ShowBVPlan`, `ShowPercentagePlan`, chart/ROR flags;
@@ -120,47 +161,59 @@ UI serialize option thành hai chuỗi key/value; SP chuyển lại thành bản
 - disclosure: `IncludeCostDisclosure`, `IncludeRiskSummary`;
 - split: `SplitByDealerCode`, `SplitGroupID`.
 
-Đây là contract stringly typed: sai chính tả thường rơi về default và không có compile-time error. Khi đổi key phải tìm cả UI writer lẫn mọi generator reader.
+Đây là contract stringly typed: typo thường rơi default và không có compile-time error. Khi đổi key phải tìm UI writer, SQL serialization và mọi generator reader.
 
-## 7. Findings
+## 8. Findings
 
-### PDF-ADHOC-01 — file mode thiếu năm report type
+### PDF-ADHOC-01 — dispatch file mode thiếu năm type
 
-Với `>5` client, type `11`, `12`, `14`, `50`, `104` không có trong switch file mode dù memory mode hỗ trợ. Kết quả có thể là PDF thiếu client/nội dung hoặc `MainPdfObj` không hợp lệ. Nên dùng một hàm dispatch chung cho cả hai mode.
+Với `>5` client, type `11,12,14,15,50` không có trong switch file mode dù memory mode hỗ trợ. Nên dùng một hàm dispatch chung; nếu chưa refactor phải giữ hai switch đồng bộ.
 
-### PDF-ADHOC-02 — đọc thiếu byte cuối file PDF
+### PDF-ADHOC-02 — đọc thiếu byte cuối
 
-File mode cấp phát `new byte[stream.Length - 1]` rồi chỉ đọc số byte đó ([source](../../../VieFUNDPdf/ClientReportAdhoc.cs#L227)). Output bị cắt đúng một byte. Một số PDF reader có thể tự phục hồi, nhưng đây vẫn là binary corruption. Phải cấp phát `stream.Length` và đọc đủ stream.
+File mode cấp phát `new byte[stream.Length - 1]` rồi chỉ đọc số byte đó. Output bị cắt đúng một byte. Pattern tương tự còn có trong `CForm` multi-ticket và `CPortfolioFundFact`; đây là lỗi cross-pipeline [S].
 
-### PDF-ADHOC-03 — abort có thể để lại file/handle
+### PDF-ADHOC-03 — cleanup và stale file
 
-Trong vòng lặp file mode, khi `m_Abort=true`, hàm `return null` trước `pdfDoc.Close()` và `File.Delete()`. Cần chuyển cleanup vào `finally`/`using`; đồng thời bảo đảm writer/document được dispose khi generator ném exception.
+Abort trong loop return trước `pdfDoc.Close`/`File.Delete`; exception cũng có thể bỏ qua `UBReportRequestTMPEnd`. Writer dùng `FileMode.OpenOrCreate`, không truncate file cũ; nếu filename bị reuse và output mới ngắn hơn, stale tail có thể còn lại [S]. Cần `try/finally`/`using`, `FileMode.Create` và cleanup idempotent.
 
-### PDF-ADHOC-04 — output TMP có thể bị ghi đè khi chạy đồng thời
+### PDF-ADHOC-04 — slot TMP/concurrency
 
-`UBReportPdfObjTMPAdd` upsert theo `(iUserID, iType)`, không theo request ID. Hai report cùng user và type chạy chồng nhau có thể thay output của nhau. Cần xác minh UI có khóa concurrent request hay không; nếu không, nên bind object với request/token.
+`UBReportPdfObjTMPAdd` key logic theo user/type, không theo request; `TOP 1` không order và DDL uniqueness chưa có. Cần kiểm tra UI lock, unique index live và bind download với request/token [A]/[L].
 
-### PDF-ADHOC-05 — namespace bảng TMP không nhất quán trong SQL snapshot
+### PDF-ADHOC-05 — namespace TMP không nhất quán
 
-`UBReportRequestTMP` dùng tên `dbo.UB_Report*TMP`, còn `UBReportRequestTMPEnd` dùng `VieFUNDTMP.dbo.UB_Report*TMP`. Tương tự Settlement, cần kiểm tra synonym/duplicate objects trên DB thật trước khi kết luận lỗi runtime.
+Core SP trộn `dbo.UB_Report*TMP` và `VieFUNDTMP.dbo.UB_Report*TMP`. Phải query `sys.synonyms`, `sys.tables`, `sys.sql_expression_dependencies` trên cả database trước khi kết luận runtime [A]/[L].
 
-## 8. Cách thêm report type an toàn
+### PDF-ADHOC-06 — owner filter của request
 
-1. Xác định type ID không trùng trong UI/DB/router.
-2. Tạo DataSet method với SP và `RecType` contract rõ ràng.
-3. Tạo generator trả `byte[]`; test rỗng, một trang và nhiều trang.
-4. Thêm dispatch **một nơi dùng chung** cho memory/file mode; nếu chưa refactor thì cập nhật cả hai switch.
-5. Thêm option UI và kiểm tra key reader/writer.
-6. Test `1`, `5`, `6` và `>6` client để đi qua cả hai mode.
-7. Test abort/exception, temp-file cleanup và concurrent request cùng user.
-8. Test EN/FR, duplex, split dealer, disclosure và chart nếu report dùng.
-9. Xác minh output tải đúng user/request và không lộ dữ liệu giữa session.
+Artifact `UBReportRequestTMP` không dùng `iUserID` trong predicate lấy request. Cần chứng minh authorization ở caller/BLL/deployed SP và test cross-user request ID [A]/[L].
 
-## 9. Source và tài liệu liên quan
+### PDF-ADHOC-07 — branch `iRunMode>0` không reachable và chưa chứng minh durable request
 
-- [`ClientReportAdhoc.cs`](../../../VieFUNDPdf/ClientReportAdhoc.cs)
-- [`CReport.cs`](../../../VieFUNDPdf/CReport.cs)
+Handler hard-code `iRunMode=0`. Nếu branch `>0` được bật lại, `AddRequestTMP` vẫn chạy trước khi rẽ nhánh service; tài liệu không được khẳng định branch này tự tạo `UB_ReportRequest` nếu chưa trace consumer/creator khác [S].
+
+## 9. Cách thêm/sửa report type an toàn
+
+1. Chốt source project/deployed DLL; không trộn dispatch của hai source tree.
+2. Xác định type ID không trùng trong UI/DB; phân biệt với WebApp route ID.
+3. Ghi rõ SP parameter, result-set columns, `RecType`, default và side effect.
+4. Tạo generator trả `byte[]`; test empty, một trang, nhiều trang và invalid option.
+5. Dùng một dispatcher chung cho memory/file; nếu chưa refactor, cập nhật cả hai switch.
+6. Test đúng boundary `1`, `5`, **`6`**, `7+` client.
+7. Test abort/exception, temp cleanup, filename reuse và binary EOF.
+8. Test concurrent request cùng user/type và cross-user request/download authorization.
+9. Test EN/FR, duplex, split dealer, disclosure, chart và response MIME nếu áp dụng.
+10. Đối chiếu deployed SP/constraint bằng metadata read-only; không execute SP có side effect để audit.
+
+## 10. Source và database artifact
+
+- [`ClientReportAdhoc.cs`](../../../DLLs/VieFUNDPdf/ClientReportAdhoc.cs)
+- [`CReport.cs`](../../../DLLs/VieFUNDPdf/CReport.cs)
 - [`PopupClientReportTypes.aspx.cs`](../../../WebApp/Main/PopupClientReportTypes.aspx.cs)
+- [`000_4_CreateSP.sql`](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_4_CreateSP.sql)
+- [`000_3_CreateUDF.sql`](../../../MyPortfolioNew/VieFUND-Platform/src/SQLScript/000_3_CreateUDF.sql)
+- [`Table_Description.md`](../../Database/Table_Description.md)
 - [Report Catalog](report-catalog.md)
 - [PDF Workflow](../../viefund-framework/pdf/pdf-workflow.md)
 - [Charts](../../viefund-framework/charts.md)

@@ -78,6 +78,7 @@ Tìm kiếm nhanh → vào [reference/](reference/README.md):
 | [Business Logic Topics](business-logic-topics/README.md) | Tài liệu giải thích từ người phát triển gốc |
 | [Database — Table Description](Database/Table_Description.md) | Tài liệu mô tả bảng dữ liệu bổ sung |
 | [Tools](tools/README.md) | Scripts testing và mock FundServ responses |
+| [Triển khai Production](<Huong dan trien khai Production/production-deployment-guide.md>) | Các bước cấu hình và cài đặt từ server trắng đến khi toàn hệ thống hoạt động |
 | [Triển khai GitBook](GitBook/GitBookDeploy.md) | Hướng dẫn build và publish hệ thống tài liệu |
 
 ---
@@ -88,6 +89,7 @@ Tìm kiếm nhanh → vào [reference/](reference/README.md):
 Tôi có nội dung mới →
 ├── Thuộc chủ đề nghiệp vụ cụ thể? → topics/<topic>/<file>.md
 ├── Framework ? → viefund-framework/<file>.md
+├── Triển khai/vận hành toàn hệ thống? → Huong dan trien khai Production/<file>.md
 ├── Legacy/ghi chú thô? → business-logic-topics/<file>.md
 ├── Công cụ/script? → tools/<file>
 └── Dữ liệu tra cứu? → reference/<file>.md

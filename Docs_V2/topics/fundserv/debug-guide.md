@@ -1,522 +1,256 @@
-# Debug Guide: TFS/NFU File Generation Flow
+# Hướng dẫn debug Fundserv — batch file và IBM MQ
 
-Hướng dẫn từng bước tạo file TFS (Order) và NFU (Non-Financial Update) gửi FundServ — từ giao diện đến file output — phục vụ debug và kiểm tra.
+> **Phạm vi:** debug hai kênh Fundserv độc lập trong source hiện tại. Tài liệu không chứng minh binary, stored procedure (SP), schema hay cấu hình production đang trùng repository.
+>
+> **Nguyên tắc an toàn:** bắt đầu bằng quan sát read-only. Không chạy SP tạo/import/replay trực tiếp, không sửa trạng thái và không chép file archive trở lại IN nếu chưa có phê duyệt của application owner/DBA.
 
----
+Các nhãn dùng trong trang này theo [README của topic](README.md): **Verified**, **DB/SP-dependent**, **External boundary** và **Historical**.
 
-## Mục lục
+## 1. Chọn đúng pipeline trước khi debug
 
-1. [TFS — Tạo Order File từ A đến Z](#1-tfs--tạo-order-file)
-2. [NFU — Tạo NFU File từ A đến Z](#2-nfu--tạo-nfu-file)
-3. [Kiểm tra Output File](#3-kiểm-tra-output-file)
-4. [Debug Breakpoints](#4-debug-breakpoints)
-5. [SQL Queries kiểm tra trạng thái](#5-sql-queries-kiểm-tra-trạng-thái)
-6. [Troubleshooting](#6-troubleshooting)
+| Kênh | Service | Outbound | Response | Có dùng IN/OUT/archive? |
+|---|---|---|---|---|
+| **Batch filesystem** | `VieFUNDIE` | DB → `COrder.OrderFileGenerate`/`CXM.FileGenerate` → OUT | Gateway ngoài repository đặt physical file vào IN → `FFImport.ProcessAllX` | Có |
+| **IBM MQ realtime** | `VieFUNDMQ` | DB → MQ send queue | MQ response queue → `COrder.ProcessResponseMsg` → order response parser | Không |
 
----
+**Verified:** `VieFUNDIE.OnTimer` sinh order/NFU rồi quét inbound; `VieFUNDMQ.OnTimer` mở queue, nhận, gửi và nhận lại. Hai service không phải hai bước của cùng một pipeline.
 
-## 1. TFS — Tạo Order File
+Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:654-818`; `Services/VieFUNDMQ/VieFUNDMQ.cs:1306-1499`.
 
-### Bước 1: Tạo Order (UI)
+```text
+Batch: DB -> VieFUNDIE -> OUT -> [gateway ngoài repo] -> Fundserv
+       DB <- DR/XR parser <- IN <- [gateway ngoài repo] <- Fundserv
 
-**Page**: `PopupTradeAdd.aspx`  
-**Code-behind**: `WebApp/Main/PopupTradeAdd.aspx.cs`
-
-1. Mở client profile → click **"Trade"** hoặc **"Order Entry"**
-2. Chọn Plan + Account từ dropdown
-3. Chọn loại lệnh (tab):
-   - **Buy** — mua fund
-   - **Sell** — bán/rút fund
-   - **Switch** — chuyển đổi giữa các fund
-   - **Transfer** — chuyển ra ngoài dealer
-   - **ICT** — Inter-Company Transfer
-4. Điền thông tin lệnh (amount, settlement method, etc.)
-5. Click **"Add Trade"** button
-
-**Code flow khi click Add Trade:**
-```
-PopupTradeAdd.aspx.cs :: OnAddTrade() (L4237)
-├── switch(hdActionType.Value)
-│   ├── "Buy"     → OnBuy()      (L2985)
-│   ├── "Sell"    → OnSell()
-│   ├── "Switch"  → OnSwitch()
-│   ├── "Transfer"→ OnTransfer()
-│   └── "ICT"     → OnICT()
-└── Mỗi method gọi SP "UBOrderAdd" hoặc tương tự
-    → Tạo record trong bảng Orders với status = "Pending"
+MQ:    DB -> VieFUNDMQ -> send queue -> Fundserv
+       DB <- response parser <- response queue <- Fundserv
 ```
 
-> **Debug**: Breakpoint tại `OnAddTrade()` (L4237) để xem action type, sau đó step into `OnBuy()` etc.
+> **Không suy diễn ACK:** một file xuất hiện trong OUT hoặc DB được cập nhật sau khi ghi file chỉ chứng minh bước local đã chạy. Nó không chứng minh gateway đã pickup, Fundserv đã nhận, hay nghiệp vụ đã được chấp nhận.
 
-### Bước 2: Tag và Generate Order (UI)
+## 2. Debug batch filesystem (`VieFUNDIE`)
 
-**Page**: `PopupOrderBatch.aspx`  
-**Code-behind**: `WebApp/Main/PopupOrderBatch.aspx.cs`
+### 2.1 Xác định DBID, DSID và paths thực tế
 
-1. Mở **Order Entry** page (từ menu chính)
-2. Tab **"Pending"** → hiện danh sách orders chờ gửi
-3. Chọn **Dealer Code** và **Network** (FundServ=default, Manual=2, ETF=4)
-4. **Tag** (checkbox) các orders cần gửi → gọi `CTrx.OrderPendingSelectionUpdate()` (SP: `UBOrderSelectionUpdate`)
-5. Chọn mode:
-   - **Real-time**: radio `rdModeRT` — gửi ngay qua MQ
-   - **Batch**: radio `rdModeBatch` — đợi service poll
-6. Click **"Generate Order"** → `OnGenerateOrderFile()` (L295)
-   - Hiện confirm dialog
-7. Click OK → `OnGenerateOrderFileBtn()` (L320)
+Các paths runtime được nạp từ topic DB settings `Service` qua `CDatabase.GetVieFundIESettings`:
 
-**Code flow khi confirm:**
-```
-PopupOrderBatch.aspx.cs :: OnGenerateOrderFileBtn() (L320)
-├── if(network == FundServ)
-│   └── CTrx.OrderPendingMove2Waiting() 
-│       → SP: "UBOrderWaiting2SendAdd"
-│       → Chuyển tagged orders → status = "Waiting"
-│       → Return: iCount (số order), iCountFailed, ErrorMSG
-├── if(network == Manual/2)
-│   └── CTrx.OrderPending2Confirm()
-│       → SP: "UBOrderSetConfirmTaggedItems"
-└── if(network == ETF/4)
-    └── CTrx.OrderPendingMove2BBS()
-        → SP: "UBOrderWaiting2BBSOrder"
-```
+| Key | Vai trò runtime |
+|---|---|
+| `FILE_PATH` | IN/root được quét |
+| `FILE_PATH_UPLOAD` | OUT cho TFS/NFU |
+| `FILE_PATH_IMPORTED` | archive thành công |
+| `FILE_PATH_ERROR` | archive khi có lỗi record/parser |
+| `FILE_PATH_SKIPPED` | file bỏ qua/không xử lý được |
+| `FILE_ENCODING` | code page phục vụ inbound discovery/flat-file handling; mặc định source là `1252` |
 
-**Stored Procedures quan trọng:**
+**Không lấy các key này từ `Services/VieFUNDIE/App.config`.** File đó chỉ có `DEBUGMODE`, `QUERYINTERVAL` và service URI. DB được chọn qua danh sách registry; `OnTimer` lặp qua DSID và truyền DSID vào wrapper settings. Tuy nhiên, implementation wrapper nhìn thấy trong repository chỉ bind `TopicStr` khi gọi `UBFSRuleList`, nên không được khẳng định settings được lọc theo DSID nếu chưa kiểm tra SP deploy. Nếu DB settings thiếu hoặc path không tồn tại, source dựng fallback từ thư mục executable (`FF`, `Imported`, `Error`, `Skipped`, `OUT`) và có thể ghi lại settings. Fallback là hành vi code, không phải bằng chứng path production.
 
-| SP Name | Chức năng |
-|---------|-----------|
-| `UBOrderPendingList` | Load danh sách pending |
-| `UBOrderSelectionUpdate` | Tag/untag orders |
-| `UBOrderWaiting2SendAdd` | Chuyển Pending → Waiting |
-| `UBOrderCreateFile` | Tạo XML body cho file |
-| `UBOrderFileUpdateStatus` | Cập nhật status sau khi ghi file |
+Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:35-43,90-121,442-615`; `Services/VieFUNDIE/App.config:1-8`; `DLLs/UBConnection/CDatabase.cs:1906-1923`.
 
-> **Debug**: Breakpoint tại `OnGenerateOrderFileBtn()` (L320). Xem giá trị `iMode`, `iNetwork`, `iCount`.
+Checklist read-only:
 
-### Bước 3: Service tạo file (VieFUNDIE)
+1. Xác nhận đúng host/service binary, DBID và DSID; source DLL trong repository có thể khác binary deploy.
+2. Đọc topic `Service` bằng công cụ quản trị/query đã được môi trường phê duyệt.
+3. Ghi lại năm path trên, service account, ACL và free space.
+4. Xác nhận path là local hay UNC và kiểm tra quyền dưới **service account**, không chỉ tài khoản cá nhân.
+5. Kiểm tra schedule (`NO_RUNTIME`, `NO_WRUNDAY`, `NO_MRUNDAY`, `TEST_RUN`) trước khi kết luận timer hỏng.
 
-**File**: `VieFUNDIE/VieFUNDIE.cs`  
+### 2.2 Outbound order/TFS
 
-Service chạy nền, poll mỗi ~60 giây:
+Call path đã xác minh:
 
-```
-OnTimer() (L654)
-├── GetDBIDStr() — lấy DB connection
-├── LoadSettings(DSID) — load paths (FILE_PATH_UPLOAD etc.)
-├── IsIgnore(dtServer) — check schedule (no-run times)
-├── COrder.OrderFileGenerate() (L754)    ← TFS
-│   └── [xem bước 3a]
-├── Thread.Sleep(100)
-├── CXM.FileGenerate() (L758)           ← NFU
-│   └── [xem bước NFU]
-├── Thread.Sleep(100)
-├── CannexOrder.OrderFileGenerate()      ← GIC
-└── FFImport.ProcessAllX()               ← Import response files
+```text
+VieFUNDIE.OnTimer
+  -> COrder.OrderFileGenerate
+     -> UBOrderCreateFile                 [DB/SP-dependent, có thể có side effect]
+     -> OrderFileCreate                   [ghi local vào FILE_PATH_UPLOAD]
+     -> UBOrderFileUpdateStatus(iStatus=1) [chỉ sau khi C# ghi thành công]
 ```
 
-### Bước 3a: COrder.OrderFileGenerate()
+Source evidence: `DLLs/UBFFImport/COrder.cs:86-166`; `Services/VieFUNDIE/VieFUNDIE.cs:735-803`.
 
-**File**: `UBFFImport/COrder.cs` → `OrderFileGenerate()` (L86)
+Kiểm tra theo thứ tự:
 
-```
-OrderFileGenerate(AppID, ComputerName, eLog, DBIDStr, DSID, FileUploadPath)
-│
-├── GetFSVersion(32)           → xác định version (hiện: 35)
-│
-├── db.SetSP("UBOrderCreateFile")
-│   db.AddParam("iOptions", 0)
-│   db.ExecuteSQL()
-│
-├── while(db.Read())           → loop qua các file cần tạo
-│   ├── FileName    = db.GetStr("FileName")     // e.g. "CO_1274_20260430_001.xml"
-│   ├── OrderMSG    = db.GetStr("OrderMSG")     // XML body string
-│   ├── iVersion    = db.GetInt32("iVersion")   // 35
-│   ├── bLTI        = db.GetBool("bLTI")        // LTI namespace flag
-│   └── iFileID     = db.GetInt32("iFileID")
-│
-├── OrderFileCreate(FileUploadPath, FileName, OrderMSG, iVersion, bLTI)
-│   ├── Gọi OrderMsgCreate() → wrap XML body:
-│   │   <?xml version="1.0" encoding="UTF-8"?>
-│   │   <OrdSet xmlns="tfs" ... Version="35">
-│   │     {OrderMSG body}
-│   │   </OrdSet>
-│   ├── FileStream → ghi ra: {FileUploadPath}\{FileName}
-│   └── Return true/false
-│
-└── if(success && iFileID > 0)
-    └── SP: "UBOrderFileUpdateStatus" → iStatus = 1 (đã ghi file)
+1. Windows service đang chạy và timer không bị schedule bỏ qua.
+2. Event log có lỗi từ `UBOrderCreateFile`, tạo file hoặc quyền filesystem không.
+3. OUT có filename/body do SP trả về không; so sánh timestamp với lần timer và giữ hash/copy forensic nếu điều tra incident.
+4. DB audit/status có `iFileID` tương ứng không; diễn giải status theo SP/schema đang deploy.
+5. Sau OUT là **external boundary**: repository-wide source review không tìm thấy FTP/SFTP/gateway pickup client cho hop này. Đây là negative inventory finding, không phải line-local proof hoặc bằng chứng về deployment ngoài repository. Dùng log/ACK của gateway hoặc Fundserv do owner cung cấp để chứng minh delivery.
+
+`iStatus=1` trong `UBOrderFileUpdateStatus` xảy ra ngay sau local write. Không gọi trạng thái này là “Fundserv ACK”, “delivered” hay “accepted” nếu chưa có bằng chứng ngoài repository.
+
+### 2.3 Outbound NFU
+
+Call path:
+
+```text
+VieFUNDIE.OnTimer
+  -> CXM.FileGenerate
+     -> UBNFUCreateFile
+     -> NFUFileCreate [ghi local vào FILE_PATH_UPLOAD]
 ```
 
-> **Debug**: Breakpoint tại `OrderFileGenerate()` (L86). Kiểm tra `FileUploadPath` có đúng không, `FileContentStr` có data không.
+Comment tại call SP nói `UBNFUCreateFile` thay đổi file/message status trước bước ghi của C#; method không có post-write ACK call tương đương order. Vì vậy càng không được suy trạng thái DB là ACK từ Fundserv.
 
----
+Source evidence: `DLLs/UBFFImport/CXM.cs:77-149`.
 
-## 2. NFU — Tạo NFU File
+Kiểm tra cùng OUT path, ACL, EventLog và DB state như TFS, nhưng xác nhận contract/side effect của `UBNFUCreateFile` trên đúng DB deploy trước khi kết luận hay chạy thủ công.
 
-### Bước 1: Tạo NFU record (UI)
+### 2.4 Inbound physical files
 
-NFU records được tạo từ nhiều page khác nhau:
+`VieFUNDIE` truyền IN và ba archive paths vào `FFImport.ProcessAllX`. Runtime lấy file-code definitions từ DB. Generic discovery dùng `FileCode + "*"`; test mode còn dùng `FileCodeTest + "*"`; ngoài ra source có nhiều special patterns được xét riêng. Không áp một filename/date convention duy nhất cho mọi file.
 
-| Page | File | Khi nào |
-|------|------|---------|
-| Plan Add | `PopupPlanAdd.aspx.cs` | Tạo account mới, đổi successor |
-| Account Add | `PopupAccountAdd.aspx.cs` | Thay đổi account attributes |
-| TFSA Edit | `PanelTFSAEdit.aspx.cs` | Chỉnh sửa TFSA successor |
-| Beneficiary | `PanelPlanBenAdd.aspx.cs` | Thêm/sửa beneficiary |
-| Client Edit | Nhiều pages | Đổi tên, địa chỉ client |
+Source evidence: `DLLs/UBFFImport/FFImport.cs:722-760,792-1500,1728-1885`.
 
-Tất cả đều gọi:
-```
-CNFU.AddNFU(DBIDStr, DSIDStr, iUserID, iLinkedID, iLinkedType, ...)
-→ SP: "UBNFUAdd"
-→ Tạo record NFU với status = "Pending"
-```
+Với physical XML response chính:
 
-**Code**: `UBClasses/NFU.cs` → `AddNFU()` (L458)
+- `DR` → `COrder.ImportXML`.
+- `XR` → `CXM.ImportXML`.
+- Row file-code phải map đúng và có `HeaderID == "XML"`; nếu không, dispatcher chọn flat-file path.
 
-### Bước 2: Tag và Generate NFU (UI)
+Source evidence: `DLLs/UBFFImport/FFImport.cs:1849-1885,2389-2471`.
 
-**Page**: `PopupOrderBatch.aspx` — Tab **"NFU"** (index 2)
+Checklist:
 
-1. Chọn loại NFU cần gửi (checkboxes):
-   - `chNFUClientName` — Client Name change
-   - `chNFUClientAddress` — Address change
-   - `chNFUNewAcct` — New Account setup
-   - `chNFUBeneficiary` — Beneficiary update
-   - `chNFUAcctAttr` — Account Attributes
-   - `chNFUDistributionOpt` — Distribution Options
-   - `chNFUAddPAC` — Pre-Authorized Chequing
-   - `chNFUAdvisorInfo` — Advisor Info
-   - `chNFUDeactivateAdvisor` — Deactivate Advisor
-   - `chNFURepTransfer` — Rep Transfer
-   - `chNFUFATCA` — FATCA reporting
-   - `chNFUAddModFee` — Fee modification
-   - `chNFUAddModCDIC` — CDIC
-2. **Tag** items → `CNFU.PendingSelectionUpdate()` (SP: `UBNFUSelectionUpdate`)
-3. Click **"Generate NFU"** → `OnGenerateNFUFile()` (L873)
+1. **IN:** file có nằm trong configured `FILE_PATH` của đúng DB/environment, readable, ổn định và match code/pattern runtime không; ghi lại DSID context của timer nhưng không suy ra path đã được SP filter theo DSID.
+2. **File-code row:** kiểm tra `FileCode`, `FileCodeTest`, `HeaderID`, thứ tự và test-mode flags trên đúng DB.
+3. **Event logs:** tìm cùng time window, filename, FileID và DSID ở cả Windows Event Log lẫn DB event audit.
+4. **DB file audit:** đối chiếu record do `UBFF_Add` tạo và kết quả/counters do `UBFF_End` ghi.
+5. **Business audit:** kiểm tra order/NFU rows bị tác động bởi SP, không chỉ vị trí file.
+6. **Archive:** tìm cả `Imported`, `Error` và `Skipped`; path thành công có thể thêm category/date tùy file code và date parse được.
 
-**Code flow:**
-```
-PopupOrderBatch.aspx.cs :: OnGenerateNFUFile() (L873)
-└── CNFU.PendingMove2Waiting(DBIDStr, DSIDStr, iUserID, ...)
-    → SP: "UBNFUPendingMove2Waiting"
-    → Chuyển tagged NFUs → status = "Waiting"
-    → Return: iCount
-```
+`WriteEventLog` gọi cả `EventLog.WriteEntry` và `CDatabase.StoreEventLog`; khi đã có DB context, audit được ghi vào DB hiện tại. Tên table/view phía sau `StoreEventLog` là **DB/SP-dependent**. Cả wrapper log của service và import DLL đều nuốt exception khi chính thao tác ghi log lỗi, nên **không thấy log không chứng minh không có lỗi**.
 
-**Stored Procedures quan trọng:**
+Source evidence: `Services/VieFUNDIE/VieFUNDIE.cs:62-85`; `DLLs/UBFFImport/FFImport.cs:72-92,2060-2153`.
 
-| SP Name | Chức năng |
-|---------|-----------|
-| `UBNFUPendingList` | Load danh sách NFU pending |
-| `UBNFUSelectionUpdate` | Tag/untag NFU items |
-| `UBNFUPendingMove2Waiting` | Chuyển Pending → Waiting |
-| `UBNFUAdd` | Tạo NFU record mới |
-| `UBNFUCreateFile` | Tạo XML body cho file |
+> **Known source risk — có thể trả success trước khi parser root chạy:** `COrder.ImportXML` và `CXM.ImportXML` đều khởi tạo `Ret = true`. Nếu không mở được XML stream/reader, code ghi log rồi trả lại `true`; nếu đọc hết mà không gặp root được nhận diện (`OrdSet`/`ErrorSet` cho order, `MessageSet` cho NFU), `Ret` cũng có thể vẫn là `true`. `UBFF_Add` đã chạy trước khi dispatch, còn `UBFF_End` chỉ chạy trong processor của root được nhận diện. Vì vậy có thể tồn tại record Add không có End và `ProcessAllX` vẫn move file theo nhánh success. Khi debug phải đối chiếu cặp Add/End, counters và business rows; `Imported`, không có error log hoặc chỉ có FileID đều chưa đủ chứng minh import hoàn tất.
+>
+> Source evidence: `DLLs/UBFFImport/COrder.cs:168-208,323-425`; `DLLs/UBFFImport/CXM.cs:151-271`; `DLLs/UBFFImport/FFImport.cs:1888-1930,2389-2471`.
 
-### Bước 3: Service tạo file (VieFUNDIE)
+### 2.5 Diễn giải archive đúng mức
 
-**File**: `UBFFImport/CXM.cs` → `FileGenerate()` (L77)
+| Kết quả C# | Move dự kiến | Điều có thể kết luận |
+|---|---|---|
+| `Ret == 1` | `Imported[/category][/YYYY/MM/DD]` | Handler trả success theo call path hiện tại |
+| `Ret == 3` | `Error` | Có lỗi parser/record theo handler |
+| Các giá trị khác | `Skipped` | Không được coi là “chưa xử lý, chắc chắn sẽ retry” |
 
-```
-FileGenerate(AppID, ComputerName, eLog, DBIDStr, DSID, FileUploadPath)
-│
-├── iDefVersion = COrder.GetFSVersion(35)
-│
-├── db.SetSP("UBNFUCreateFile")
-│   db.AddParam("iOptions", 0)
-│   db.ExecuteSQL()
-│
-├── while(db.Read())
-│   ├── FileName    = db.GetStr("FileName")     // e.g. "NFU_1274_20260430_001.xml"
-│   ├── MSG         = db.GetStr("MSG")          // XML body
-│   ├── iVersion    = db.GetInt32("iVersion")   // 35
-│   └── iFileID     = db.GetInt32("iFileID")
-│
-└── NFUFileCreate(FileUploadPath, FileName, MSG, iVersion)
-    ├── Version capping:
-    │   if(iVersion < 34) iVersion = 34
-    │   if(dtToday >= 2025-09-06) iVersion = 35
-    ├── Wrap XML:
-    │   <?xml version="1.0" encoding="UTF-8"?>
-    │   <MessageSet xmlns="nfu" ... Version="35">
-    │     {MSG body}
-    │   </MessageSet>
-    └── FileStream → ghi ra: {FileUploadPath}\{FileName}
-```
+`DR` map category `TRX`; `XR` không có category trong `GetImportedSubDir`, nên không mặc định tìm XR ở `Imported/TRX`. Date folders chỉ được thêm khi `FileDateStr` đủ dài.
 
----
+Source evidence: `DLLs/UBFFImport/FFImport.cs:1562-1688,1888-1924`.
 
-## 3. Kiểm tra Output File
+> File nằm trong `Imported` cũng không tự chứng minh mọi business row đã cập nhật đúng. Luôn đối chiếu `UBFF` audit, event audit và trạng thái nghiệp vụ trên DB deploy.
 
-### Tìm Output Directory
+### 2.6 Known source risk: `Ret == 2`, Skipped và replay
 
-Có 3 cách xác định thư mục output:
+Có mâu thuẫn trực tiếp trong `FFImport.ProcessAllX`:
 
-**Cách 1: Từ WebApp**
-- Mở `PopupFundServ.aspx` → field `idFundServUploadPath`
-- Thường là: `\\<server>\VieFUND\FF\OUT\` hoặc `C:\VieFUND\FF\OUT\`
+- Comment nói system error `Ret == 2` **không được move file**.
+- Code chỉ tách `Ret == 1` sang Imported và `Ret == 3` sang Error; nhánh `else` move mọi giá trị khác, gồm `2`, sang Skipped.
+- Sau đó, nếu tổng record dưới threshold, code gán lại `Ret = 1` và `goto First_Step`.
 
-**Cách 2: Từ VieFUNDIE App.config**
-- File: `VieFUNDIE/App.config` → key `FILE_PATH` 
-- Hoặc check DB: SP `GetVieFundIESettings` trả về `FILE_PATH_UPLOAD`
+Source evidence: `DLLs/UBFFImport/FFImport.cs:1888-1930`.
 
-**Cách 3: Từ DB**
+Hệ quả vận hành:
+
+- Không hứa automatic retry cho file system error.
+- `Skipped` không đồng nghĩa “an toàn để copy lại vào IN”.
+- DR/XR có thể đã gọi SP theo record/batch và ghi `UBFF_Add`/`UBFF_End`; source không tạo transaction bao trùm toàn file. Replay có nguy cơ duplicate hoặc tiếp tục trên side effects đã commit một phần.
+
+Quy trình recovery tối thiểu:
+
+1. Giữ nguyên/copy forensic file, timestamps và hash; không chỉnh body tại chỗ.
+2. Tra Windows Event Log, DB event audit, FileID (`UBFF` audit), raw response nếu có và affected business rows.
+3. Xác định record nào chưa/chưa chắc/đã apply và kiểm tra idempotency của SP đang deploy.
+4. Lập rollback/reconcile plan.
+5. Chỉ restore/replay sau phê duyệt của application owner/DBA và theo runbook môi trường.
+
+Source evidence: `DLLs/UBFFImport/COrder.cs:360-425,759-824`; `DLLs/UBFFImport/CXM.cs:207-271,507-636`; `DLLs/UBFFImport/FFImport.cs:2060-2153`.
+
+## 3. Version và encoding thực tế
+
+### 3.1 Batch XML outbound
+
+Theo source snapshot:
+
+- Order: giá trị dưới `35` được nâng lên `35`; với giá trị `<= 35`, dùng V35 trước `2026-06-13` và V36 từ ngày đó. Giá trị SP trả lớn hơn 35 không bị đoạn code này hạ xuống.
+- NFU áp dụng cùng cutoff trong `NFUFileCreate`.
+- Envelope khai báo `encoding="UTF-8"`; writer dùng `new StreamWriter(stream)` mà không truyền encoding explicit. Khi debug encoding, kiểm tra bytes/BOM thực tế, không chỉ nhìn XML declaration.
+
+Source evidence: `DLLs/UBFFImport/COrder.cs:20-83`; `DLLs/UBFFImport/CXM.cs:36-64`.
+
+`FILE_ENCODING` mặc định `1252` là setting của inbound handling; nó không điều khiển cách `OrderFileCreate`/`NFUFileCreate` dựng outbound XML. Không dùng nó để giải thích MQ charset.
+
+### 3.2 MQ encoding
+
+MQ có setting riêng `MQ_CHARACTERSET`, mặc định source `1208`, và được gán vào `MQMessage.CharacterSet`. Đây không phải `FILE_ENCODING`.
+
+Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:481-858,997-1018`.
+
+## 4. Debug IBM MQ (`VieFUNDMQ`) — pipeline riêng
+
+`VieFUNDMQ` đọc host/port/manager/channel/send queue/response queue/charset từ DB settings. Outbound gọi `UBOrderGetMSG`, tạo `OrdSet`, put vào send queue, rồi gọi `UBOrderSetMsgStatus`. Response được đọc trực tiếp từ response queue, lưu raw message và gọi `COrder.ImportXMLResp(..., Options=1)`; không qua IN, `FileCode*`, `UBFF_Add` physical-file lifecycle hay archive folders.
+
+Source evidence: `Services/VieFUNDMQ/VieFUNDMQ.cs:481-858,997-1209`; `Services/VieFUNDMQ/Order.cs:18-139`.
+
+Checklist MQ:
+
+1. Xác nhận đang debug đúng mode/DSID và đúng service `VieFUNDMQ`, không phải `VieFUNDIE`.
+2. Đọc DB settings đã phê duyệt cho queue manager, channel, send/response queue, TLS/key path và charset; không chép secrets vào ticket/tài liệu.
+3. Kiểm tra service/EventLog và observability của queue manager: connect/open/put/get errors, queue depth và timestamps.
+4. Đối chiếu DB message row, MQ `MsgID`, raw response audit và affected order rows.
+5. Phân biệt ba mốc: `Put` vào queue thành công, nhận response transport, và business response được SP áp dụng. Không dùng một mốc thay cho mốc khác.
+
+> **MQ response là pipeline riêng.** Thả DR/XR vào batch IN không kiểm thử MQ receive path, queue configuration, MQ message metadata hay MQ retry behavior.
+
+## 5. Query quan sát — chỉ là template
+
+> [!CAUTION]
+> **TEMPLATE ONLY.** Tên schema/SP/view, parameter, quyền và side effect phải được DBA/application owner xác nhận trên đúng DB deploy. Source chỉ chứng minh C# gọi các API/SP nhất định; không chứng minh query dưới đây chạy được trên mọi môi trường.
+
 ```sql
--- Check settings lưu trong DB
-EXEC dbo.UBVieFundIESettingsGet @DSID=1001, @TopicStr='Service'
--- Look for FILE_PATH_UPLOAD row
+/* TEMPLATE ONLY — read-only sau khi đã xác nhận contract */
+EXEC <approved_settings_reader>
+     @DSID = <target_dsid>,
+     @Topic = N'Service';
+-- Lọc các key FILE_PATH*, FILE_ENCODING hoặc MQ_* phù hợp pipeline.
 ```
 
-### Verify File Content
-
-Sau khi generate, check thư mục OUT cho file mới:
-
-**TFS file** (ví dụ `CO_1274_20260430_001.xml`):
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<OrdSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-        xmlns="tfs" xsi:schemaLocation="tfs tfs.xsd" Version="35">
-  <Msg>
-    <MsgCreate>...</MsgCreate>
-    <MsgType>
-      <OrdEntry>
-        <BuyFund>...</BuyFund>
-      </OrdEntry>
-    </MsgType>
-  </Msg>
-</OrdSet>
-```
-
-**NFU file** (ví dụ `NFU_1274_20260430_001.xml`):
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<MessageSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-            xmlns="nfu" xsi:schemaLocation="nfu nfu.xsd" Version="35">
-  <Msg>
-    <MsgCreate>...</MsgCreate>
-    <MsgType>
-      <Reqst>
-        <AcctSetup>...</AcctSetup>
-      </Reqst>
-    </MsgType>
-  </Msg>
-</MessageSet>
-```
-
----
-
-## 4. Debug Breakpoints
-
-### Recommended Breakpoints cho TFS
-
-| # | File | Method | Line | Mục đích |
-|---|------|--------|------|----------|
-| 1 | `PopupTradeAdd.aspx.cs` | `OnAddTrade()` | L4237 | Xem order data trước khi save |
-| 2 | `PopupOrderBatch.aspx.cs` | `OnGenerateOrderFileBtn()` | L320 | Xem mode, network, count |
-| 3 | `Trx.cs` | `OrderPendingMove2Waiting()` | L3968 | Xem SP params & result |
-| 4 | `COrder.cs` | `OrderFileGenerate()` | L86 | Xem XML body từ SP |
-| 5 | `COrder.cs` | `OrderFileCreate()` | L50 | Xem file path & content trước khi ghi |
-| 6 | `COrder.cs` | `OrderMsgCreate()` | L32 | Xem version & envelope XML |
-| 7 | `VieFUNDIE.cs` | `OnTimer()` | L754 | Service poll — xem có gọi không |
-
-### Recommended Breakpoints cho NFU
-
-| # | File | Method | Line | Mục đích |
-|---|------|--------|------|----------|
-| 1 | `NFU.cs` | `AddNFU()` | L458 | Xem NFU data khi tạo |
-| 2 | `PopupOrderBatch.aspx.cs` | `OnGenerateNFUFile()` | L873 | Xem count move to waiting |
-| 3 | `NFU.cs` | `PendingMove2Waiting()` | L282 | Xem SP result |
-| 4 | `CXM.cs` | `FileGenerate()` | L77 | Xem XML body từ SP |
-| 5 | `CXM.cs` | `NFUFileCreate()` | L36 | Xem file path & version |
-| 6 | `VieFUNDIE.cs` | `OnTimer()` | L758 | Service poll cho NFU |
-
-### Debug VieFUNDIE Service
-
-Service chạy dưới dạng Windows Service → không attach debugger trực tiếp được.
-
-**Cách 1: Chạy Console mode** (dev only)
-```
-VieFundIE.exe  (chạy trực tiếp từ cmd)
-```
-
-**Cách 2: Attach to Process**
-1. Build VieFUNDIE trong Debug mode
-2. Start service: `net start VieFundIE`
-3. Visual Studio → Debug → Attach to Process → `VieFundIE.exe`
-4. Đặt breakpoint tại `OnTimer()` (L654)
-
-**Cách 3: Check Event Log**
-- Windows Event Viewer → Application → source "VieFundIE"
-- Hoặc check trong DB: service ghi log via `CDatabase.StoreEventLog()`
-
----
-
-## 5. SQL Queries kiểm tra trạng thái
-
-### Check Orders đang Pending
 ```sql
--- Xem tất cả orders đang chờ gửi
-EXEC UBOrderPendingList 
-    @iUserID = <userID>,
-    @Lg = 0,
-    @iOrderStatus = 1,     -- 1=Pending, 2=Waiting
-    @DealerCode = '<code>',
-    @iPageSize = 100,
-    @iPage = 0,
-    @iOptions = 0,
-    @iNetwork = 0
+/* TEMPLATE ONLY — thay bằng approved read model của môi trường */
+SELECT <file_id>, <file_name>, <status>, <record_counters>, <timestamps>
+FROM <approved_file_audit_view>
+WHERE <dsid_predicate> AND <time_window_predicate>;
+
+SELECT <event_time>, <severity>, <message>
+FROM <approved_event_audit_view>
+WHERE <service_predicate> AND <time_window_predicate>;
+
+SELECT <business_key>, <status>, <last_modified>, <response_reference>
+FROM <approved_order_or_nfu_read_view>
+WHERE <known_test_or_incident_key_predicate>;
 ```
 
-### Check Orders đã chuyển sang Waiting
-```sql
--- Xem orders đã tagged và waiting
-EXEC UBOrderPendingList 
-    @iUserID = <userID>,
-    @Lg = 0,
-    @iOrderStatus = 2,     -- Waiting to send
-    @DealerCode = '<code>',
-    @iPageSize = 100,
-    @iPage = 0,
-    @iOptions = 0,
-    @iNetwork = 0
-```
+Không gọi `UBOrderCreateFile`, `UBNFUCreateFile`, `UBFF_Add`, `UBFF_End` hoặc response-processing SP như “preview”: chúng nằm trên production mutation path và có thể claim/create/update state.
 
-### Preview XML sẽ được tạo
-```sql
--- Chạy SP tạo file (read-only test)
-EXEC UBOrderCreateFile @iOptions = 0
--- Returns: FileName, OrderMSG (XML body), iVersion, bLTI, iFileID
-```
+## 6. Breakpoints trọng tâm
 
-### Check NFU Pending
-```sql
-EXEC UBNFUPendingList
-    @iUserID = <userID>,
-    @Lg = 0,
-    @DealerCode = '<code>',
-    @iPageSize = 100,
-    @iPage = 0,
-    @iOptions = 0,
-    @bClientName = 1,
-    @bClientAddress = 1,
-    @bNewAcct = 1
--- Thêm các flags @bXXX tùy loại NFU cần check
-```
+| Pipeline | Điểm đặt breakpoint | Mục đích |
+|---|---|---|
+| Batch orchestration | `VieFUNDIE.OnTimer` | DBID/DSID, settings, schedule, paths |
+| Batch TFS OUT | `COrder.OrderFileGenerate`, `OrderFileCreate` | SP result, filename/body, local write/status |
+| Batch NFU OUT | `CXM.FileGenerate`, `NFUFileCreate` | SP result, local write/version |
+| Batch discovery | `FFImport.GetFirstFileNameX`, `ProcessAllX` | code/pattern, selected file, `Ret`, archive |
+| Batch DR/XR | `FFImport.ImportXMLFile`, `COrder.ImportXML`, `CXM.ImportXML` | FileID, root, DB definition, SP result |
+| MQ send | `VieFUNDMQ.SendMsg`, `PutMsg` | queue, charset, MsgID, local put result |
+| MQ response | `VieFUNDMQ.GetMsgData`, `VieFUNDMQ.COrder.ProcessResponseMsg` | response queue, raw payload audit, business parser |
 
-### Check File đã tạo trong DB
-```sql
--- Xem lịch sử file đã generate
-EXEC UBOrderHistoryList
-    @iUserID = <userID>,
-    @Lg = 0,
-    @iPageSize = 50,
-    @iPage = 0,
-    @iOptions = 0,
-    @DealerCode = '<code>'
-```
+## 7. Những điểm repository không thể xác nhận
 
-### Check VieFUNDIE Service Settings
-```sql
--- Xem service config (file paths)
-EXEC UBVieFundIESettingsGet @DSID=1001, @TopicStr='Service'
--- Look for: FILE_PATH_UPLOAD → thư mục output
-```
+Cần evidence từ deployment/owner trước khi kết luận:
 
----
-
-## 6. Troubleshooting
-
-### File không được tạo ra
-
-| Nguyên nhân | Cách check | Fix |
-|-------------|------------|-----|
-| Service không chạy | `sc query VieFundIE` | `net start VieFundIE` |
-| Thư mục OUT không tồn tại | Check `FILE_PATH_UPLOAD` in DB | Tạo folder |
-| IsIgnore() return true | Check time/day vs no-run schedule | Chờ đúng giờ hoặc set `TEST_RUN=Y` |
-| No orders in Waiting status | Query `UBOrderPendingList` @iOrderStatus=2 | Re-generate từ UI |
-| SP trả về empty | Run `UBOrderCreateFile` manually | Check SP logic |
-| Permission denied | Check folder write permission for service account | Grant NTFS permissions |
-
-### Order không hiện trong Pending list
-
-| Nguyên nhân | Cách check |
-|-------------|------------|
-| Wrong dealer code selected | Check `cbDealerCodeList` giá trị |
-| Order status sai | Check `cbOrderStatus2Send` value |
-| Different network | Check `cbNetwork` selected value |
-| User permission | Check `CMember.IsFundServCOFile()` |
-
-### XML version sai
-
-Check `COrder.GetFSVersion()` (COrder.cs L20):
-```csharp
-// Hiện tại:
-if (iVersion < 34) iVersion = 34;
-if (iVersion <= 34) {
-    if (DateTime.Now >= new DateTime(2025, 9, 6)) iVersion = 35;
-}
-// V36 chưa có → cần thêm cutoff cho V36
-```
-
-Và `CXM.NFUFileCreate()` (CXM.cs L36):
-```csharp
-if (iVersion < 34) iVersion = 34;
-if (iVersion <= 34) {
-    if (DateTime.Now >= new DateTime(2025, 9, 6)) iVersion = 35;
-}
-// Tương tự — cần thêm V36 cutoff
-```
-
-### Response file không import
-
-1. Check thư mục IN (`m_FilePath`): có file DR/XR mới không?
-2. Check Event Log: tìm error entries từ "VieFundIE"
-3. Check `FFImport.ProcessAllX()` trong `VieFUNDIE.cs` (L787)
-4. Check `COrder.ImportXML()` và `CXM.ImportXML()` cho parse errors
-
----
-
-## Quick Reference: File Lifecycle
-
-```
-                    ┌──── PopupTradeAdd.aspx ────┐
-                    │  OnBuy/OnSell/OnSwitch()   │
-                    │  → SP: UBOrderAdd          │
-                    │  → status = "Pending"       │
-                    └─────────────┬───────────────┘
-                                  │
-                    ┌─────────────▼───────────────┐
-                    │  PopupOrderBatch.aspx       │
-                    │  Tag orders + Generate      │
-                    │  → SP: UBOrderWaiting2Send  │
-                    │  → status = "Waiting"       │
-                    └─────────────┬───────────────┘
-                                  │
-                    ┌─────────────▼───────────────┐
-                    │  VieFUNDIE :: OnTimer()     │
-                    │  → COrder.OrderFileGenerate │
-                    │  → SP: UBOrderCreateFile    │
-                    │  → OrderFileCreate()        │
-                    │  → ghi XML ra FF\OUT\       │
-                    │  → SP: UBOrderFileUpdate    │
-                    │  → status = "Sent"          │
-                    └─────────────┬───────────────┘
-                                  │
-                    ┌─────────────▼───────────────┐
-                    │  FundServ Gateway           │
-                    │  Pick up file → transmit    │
-                    └─────────────┬───────────────┘
-                                  │
-                    ┌─────────────▼───────────────┐
-                    │  FundServ processes         │
-                    │  → Returns DR/XR file       │
-                    └─────────────┬───────────────┘
-                                  │
-                    ┌─────────────▼───────────────┐
-                    │  VieFUNDIE :: OnTimer()     │
-                    │  → FFImport.ProcessAllX()   │
-                    │  → COrder.ImportXML() [DR]  │
-                    │  → CXM.ImportXML()   [XR]   │
-                    │  → Update DB status         │
-                    └─────────────────────────────┘
-```
+- path/file-code/settings thực tế của production;
+- SP/schema/binary deploy có trùng source snapshot không;
+- gateway nào pickup/drop batch file, delivery ACK và retry của gateway;
+- XSD và response sample canonical;
+- retention/purge, duplicate suppression và quy trình replay được phê duyệt;
+- dealer/DSID được route batch, MQ hay cả hai.
